@@ -33,8 +33,8 @@ setkey API_SERVER_ENABLED true
 setkey API_SERVER_HOST 127.0.0.1
 setkey API_SERVER_PORT "$PORT"
 if ! grep -Eq "^API_SERVER_KEY=.+" "$ENVF"; then setkey API_SERVER_KEY "$(openssl rand -hex 32)"; else echo "  API_SERVER_KEY already set (kept)"; fi
-if [ -n "${WORKBENCH_TOKEN:-}" ]; then setkey WORKBENCH_TOKEN "$WORKBENCH_TOKEN"; fi
-grep -Eq "^WORKBENCH_TOKEN=.+" "$ENVF" || echo "  WORKBENCH_TOKEN missing: add the contents of \$WORKBENCH_DATA_DIR/token (or rerun with WORKBENCH_TOKEN=...)"
+if [ -n "${WORKBENCH_MCP_TOKEN:-}" ]; then setkey WORKBENCH_MCP_TOKEN "$WORKBENCH_MCP_TOKEN"; fi
+grep -Eq "^WORKBENCH_MCP_TOKEN=.+" "$ENVF" || echo "  WORKBENCH_MCP_TOKEN missing: add the contents of \$WORKBENCH_DATA_DIR/mcp_token (or rerun with WORKBENCH_MCP_TOKEN=...)"
 
 cat <<EOF
 

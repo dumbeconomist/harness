@@ -28,6 +28,7 @@ use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 
 pub use config::Config;
+pub use secrets::SecretStore;
 
 pub struct RunningServer {
     pub addr: std::net::SocketAddr,

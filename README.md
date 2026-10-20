@@ -17,7 +17,7 @@ is journaled so it can be undone where the tool supports it.
  │ /api/*  app API for the React UI                         │
  │ /mcp    MCP server (JSON-RPC, streamable HTTP) ◄── Hermes│
  │ approvals · journal(undo, idempotency) · ledger · objects│
- │ brain: OpenAI-compatible client ──► Hermes :8642         │
+ │ brain: OpenAI-compatible client ──► Hermes :8643 (locked profile) │
  │ SQLite: $WORKBENCH_DATA_DIR/workbench.db                 │
  └──────────────────────────────────────────────────────────┘
 ```
@@ -60,8 +60,8 @@ Full contracts (API, MCP tools, risk tiers, data model) are in [docs/architectur
 
    Or run the whole desktop app, shell included, with `cargo tauri dev`.
 
-No Hermes yet? Run `node tools/mock-hermes/server.js` in place of the gateway. It listens on the
-same port (8642) that the core expects by default.
+No Hermes yet? Run `MOCK_HERMES_PORT=8643 node tools/mock-hermes/server.js` in place of the gateway.
+The core expects the locked Workbench profile on port 8643 by default; the mock's own default is 8642.
 
 ## Testing
 

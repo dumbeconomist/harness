@@ -37,7 +37,7 @@ mcp_servers:
   workbench:
     url: http://127.0.0.1:8765/mcp
     headers:
-      Authorization: "Bearer ${WORKBENCH_TOKEN}"
+      Authorization: "Bearer ${WORKBENCH_MCP_TOKEN}"
     timeout: 600          # > WORKBENCH_APPROVAL_TIMEOUT_SECS (300)
     connect_timeout: 30
     # trust: full         # default; Workbench is the approval gate

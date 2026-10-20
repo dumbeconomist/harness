@@ -70,7 +70,7 @@ Response headers include `X-Hermes-Session-Id`. Note the reply text is a model r
 
 `~/.hermes/.env` (secrets live here; `${VAR}` interpolation in config values is documented and ✅ worked for `headers`)
 ```bash
-WORKBENCH_TOKEN=<contents of $WORKBENCH_DATA_DIR/token>
+WORKBENCH_MCP_TOKEN=<contents of $WORKBENCH_DATA_DIR/mcp_token>   # the MCP-only token; the UI token gets 401 on /mcp
 ```
 `~/.hermes/config.yaml`
 ```yaml
@@ -78,13 +78,13 @@ mcp_servers:
   workbench:
     url: http://127.0.0.1:8765/mcp
     headers:
-      Authorization: "Bearer ${WORKBENCH_TOKEN}"
+      Authorization: "Bearer ${WORKBENCH_MCP_TOKEN}"
     timeout: 600            # tool-call timeout; default 300 == WORKBENCH_APPROVAL_TIMEOUT_SECS
     connect_timeout: 30     # default 60
     # trust: full           # default; keep (Workbench is the approval gate)
     # tools: {include: [...], resources: false, prompts: false}
 ```
-✅ Verified exactly this shape (with `${WORKBENCH_TOKEN}` from `.env`): `hermes mcp test workbench` -> `Connected`, `Tools discovered: 1`; tool call reached the server with the right bearer.
+✅ Verified exactly this shape (with `${WORKBENCH_TOKEN}` from `.env`): `hermes mcp test workbench` -> `Connected`, `Tools discovered: 1`; tool call reached the server with the right bearer. (Round 2 renamed the variable to `WORKBENCH_MCP_TOKEN`; Workbench now issues a separate MCP-only token.)
 
 | Fact | Status |
 |---|---|
@@ -159,15 +159,15 @@ approvals: {mode: manual, unattended_mode: deny, timeout: 300}
 mcp_servers:
   workbench:
     url: http://127.0.0.1:8765/mcp
-    headers: {Authorization: "Bearer ${WORKBENCH_TOKEN}"}
+    headers: {Authorization: "Bearer ${WORKBENCH_MCP_TOKEN}"}
     timeout: 600
     connect_timeout: 30
 ```
-`.env`: `API_SERVER_ENABLED=true`, `API_SERVER_HOST=127.0.0.1`, `API_SERVER_PORT=8643`, `API_SERVER_KEY=<openssl rand -hex 32>`, `WORKBENCH_TOKEN=<core token>`. Choose the LLM with `hermes -p workbench model`.
+`.env`: `API_SERVER_ENABLED=true`, `API_SERVER_HOST=127.0.0.1`, `API_SERVER_PORT=8643`, `API_SERVER_KEY=<openssl rand -hex 32>`, `WORKBENCH_MCP_TOKEN=<contents of $DATA_DIR/mcp_token>`. Choose the LLM with `hermes -p workbench model`.
 
 ### Setup (macOS or Linux)
 ```bash
-tools/hermes-spike/workbench-profile/setup-profile.sh     # WORKBENCH_TOKEN=... optional; PROFILE / HERMES_PORT overridable
+tools/hermes-spike/workbench-profile/setup-profile.sh     # WORKBENCH_MCP_TOKEN=... optional; PROFILE / HERMES_PORT overridable
 hermes -p workbench model
 hermes -p workbench gateway run
 ```
