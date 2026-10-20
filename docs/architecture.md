@@ -138,3 +138,52 @@ impl RunningServer { pub async fn shutdown(self) }
 pub async fn serve(config: Config) -> anyhow::Result<RunningServer>   // binds, spawns, returns
 ```
 Port `0` means "pick a free port" (the shell uses this).
+
+## G0 round-2 contract changes (supersede anything above)
+Driven by the round-1 review (see scorecard.md).
+
+**Two credentials.** `ui token` (`WORKBENCH_TOKEN`, file `$DATA_DIR/token`) is accepted ONLY on `/api/*`.
+`mcp token` (`WORKBENCH_MCP_TOKEN`, file `$DATA_DIR/mcp_token`) is accepted ONLY on `/mcp`.
+Both are generated once and **persisted and reused** across launches (env var overrides file).
+`RunningServer` exposes `token` and `mcp_token`.
+
+**Stable address.** Default `WORKBENCH_ADDR=127.0.0.1:8765`. The Tauri shell binds 8765; if busy it
+falls back to port 0 and `/api/health` reports `{addr, addr_fallback:true}` so the UI can warn
+"Hermes is configured for :8765 but Workbench is on :NNNN".
+
+**Hermes defaults to the locked profile:** `HERMES_URL` default `http://127.0.0.1:8643/v1`.
+
+**Secrets.** `Config.secret_store: Option<Arc<dyn SecretStore>>` with
+`trait SecretStore: Send+Sync { fn get(&self,k:&str)->Option<String>; fn set(&self,k:&str,v:&str)->anyhow::Result<()>; }`.
+The Tauri shell provides a Keychain impl; with none, keys are memory-only and `/api/settings/hermes`
+reports `key_persisted:false`.
+
+**New endpoints (ui token):**
+- `GET /api/settings/hermes` → `{url, has_key, key_persisted, reachable, model}` (never returns the key)
+- `PUT /api/settings/hermes` `{url?, api_key?}` → persists url in settings, key via SecretStore,
+  hot-swaps the brain (no restart); returns the GET shape
+- `GET /api/settings/connection` → `{mcp_url, mcp_token, hermes_config_snippet}`: what the user
+  pastes into the Workbench Hermes profile (shown behind a "reveal" in Settings)
+
+**Undo is conflict-safe.** Journal entries store field-level `before` and the `after.updated_at`.
+Undo returns **409 `{code:"stale"}`** when the object changed since that entry (or no longer
+exists for update; for create-undo, if it was edited after creation). Message tells the user which
+newer entry to undo first.
+
+**Idempotency.** Each journal row stores `args_hash`. Explicit key reused with a different
+tool/args hash → tool error `"idempotency key reused with different arguments"` (no execution).
+Derived keys: window **60 s** and the hash includes the target object's current `updated_at`
+(update/delete) — and for create, dedupe only if the previously created object still exists unchanged.
+
+**Ledger summary** adds `{total_tokens, unpriced_runs}` and per-model `{priced:bool}`.
+
+**Approval card keyboard rules (UI):** never steal focus on mount; ⌘↵ / Esc act only when focus is
+inside the card; ignore `e.repeat` and any key within 600 ms of mount; Esc never denies (collapses
+the card to the badge); tier 2 requires a pointer click or focused-card ⌘↵ after an explicit
+"Review" expand. Full arguments always viewable; updates show old → new.
+
+**Mock Hermes agent loop.** When `MOCK_HERMES_MCP_URL` + `MOCK_HERMES_MCP_TOKEN` are set and the last
+user message matches `/add (?:a )?task(?: to)? (.+)/i`, the mock emits
+`event: hermes.tool.progress {tool:"mcp__workbench__tasks_create",toolCallId,status:"running"}`,
+calls `/mcp` `tools/call tasks_create {title}` (blocking), then emits `status:"completed"` and streams
+`Added task: <title>` or `Could not add task: <error text>`.
