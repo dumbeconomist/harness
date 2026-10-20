@@ -11,19 +11,19 @@ use crate::state::SharedState;
 use crate::tools::{self, ToolResult};
 
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
-/// Echo any well-formed date version at or after the baseline; older or
-/// malformed values fall back to the baseline.
-fn negotiate_version(requested: Option<&str>) -> &str {
-    match requested {
-        Some(v)
-            if chrono::NaiveDate::parse_from_str(v, "%Y-%m-%d").is_ok()
-                && v.len() == 10
-                && v >= PROTOCOL_VERSION =>
-        {
-            v
-        }
-        _ => PROTOCOL_VERSION,
-    }
+/// Protocol versions this server actually implements.
+const SUPPORTED_VERSIONS: [&str; 2] = ["2025-06-18", "2025-11-25"];
+const LATEST_VERSION: &str = "2025-11-25";
+
+/// Per the MCP spec the server answers with a version it supports: echo the
+/// client's request if we implement it, otherwise offer our latest and let the
+/// client decide whether it can speak that. Echoing arbitrary (future) dates
+/// would claim protocol features we do not have.
+fn negotiate_version(requested: Option<&str>) -> &'static str {
+    requested
+        .and_then(|v| SUPPORTED_VERSIONS.iter().find(|s| **s == v))
+        .copied()
+        .unwrap_or(LATEST_VERSION)
 }
 
 pub const PARSE_ERROR: i64 = -32700;
@@ -200,12 +200,11 @@ mod tests {
         for (asked, want) in [
             (Some("2025-06-18"), "2025-06-18"),
             (Some("2025-11-25"), "2025-11-25"),
-            (Some("2026-03-01"), "2026-03-01"),
-            (Some("2025-03-26"), "2025-06-18"),
-            (Some("2025-13-40"), "2025-06-18"),
-            (Some("latest"), "2025-06-18"),
-            (Some("2099-1-1"), "2025-06-18"),
-            (None, "2025-06-18"),
+            (Some("2026-03-01"), "2025-11-25"),
+            (Some("2025-03-26"), "2025-11-25"),
+            (Some("2025-13-40"), "2025-11-25"),
+            (Some("latest"), "2025-11-25"),
+            (None, "2025-11-25"),
         ] {
             assert_eq!(negotiate_version(asked), want, "{asked:?}");
         }

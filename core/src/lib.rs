@@ -163,6 +163,7 @@ pub async fn serve(config: Config) -> anyhow::Result<RunningServer> {
         brain: std::sync::RwLock::new(brain),
         hermes: std::sync::RwLock::new(hermes),
         hermes_model,
+        inflight: Default::default(),
         http: reqwest::Client::new(),
         shutdown: flag_rx,
     });

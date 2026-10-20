@@ -102,12 +102,17 @@ struct WaitGuard<'a> {
 
 impl Drop for WaitGuard<'_> {
     fn drop(&mut self) {
-        if self.armed {
-            let _ = self
-                .owner
-                .expire_if_pending(&self.id, "requester disconnected");
+        // Several callers may share one approval; only the last one out
+        // cancels it. (Our own receiver is still alive here, hence <= 1.)
+        let others = self.owner.waiter_count(&self.id).saturating_sub(1);
+        if others == 0 {
+            if self.armed {
+                let _ = self
+                    .owner
+                    .expire_if_pending(&self.id, "requester disconnected");
+            }
+            self.owner.remove_waiter(&self.id);
         }
-        self.owner.remove_waiter(&self.id);
     }
 }
 
@@ -118,6 +123,15 @@ impl Approvals {
             events,
             waiters: Mutex::new(HashMap::new()),
         })
+    }
+
+    fn waiter_count(&self, id: &str) -> usize {
+        self.waiters
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .map(|tx| tx.receiver_count())
+            .unwrap_or(0)
     }
 
     fn remove_waiter(&self, id: &str) {

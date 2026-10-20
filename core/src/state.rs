@@ -32,6 +32,9 @@ pub struct AppState {
     pub brain: RwLock<Arc<dyn Brain>>,
     pub hermes: RwLock<HermesRuntime>,
     pub hermes_model: Option<String>,
+    /// Idempotency key -> id of the approval currently awaiting a decision, so
+    /// concurrent identical calls share one card.
+    pub inflight: std::sync::Mutex<std::collections::HashMap<String, String>>,
     pub http: reqwest::Client,
     /// Flips to `true` on shutdown so long-lived SSE streams can end.
     pub shutdown: watch::Receiver<bool>,

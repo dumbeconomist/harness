@@ -499,18 +499,42 @@ pub async fn call(state: &SharedState, name: &str, args: Value) -> Result<ToolRe
     // 3. Gate.
     let mut approval_id = None;
     if policy::gate(def.tier, pol) == Gate::Ask {
-        let approval = match state
-            .approvals
-            .create(name, def.tier, &args, &summary, "agent")
-        {
-            Ok(a) => a,
-            Err(e) => return Ok(e.into()),
+        // Concurrent identical calls (same idempotency key) share one approval.
+        let approval_id_wait = {
+            let mut inflight = state.inflight.lock().unwrap_or_else(|e| e.into_inner());
+            let existing = inflight.get(&key).cloned().filter(|id| {
+                state
+                    .db
+                    .with(|c| crate::approvals::get(c, id))
+                    .ok()
+                    .flatten()
+                    .is_some_and(|a| a.status == "pending")
+            });
+            match existing {
+                Some(id) => id,
+                None => match state
+                    .approvals
+                    .create(name, def.tier, &args, &summary, "agent")
+                {
+                    Ok(a) => {
+                        inflight.insert(key.clone(), a.id.clone());
+                        a.id
+                    }
+                    Err(e) => return Ok(e.into()),
+                },
+            }
         };
-        let decided = match state
+        let waited = state
             .approvals
-            .wait(&approval.id, state.config.approval_timeout)
-            .await
+            .wait(&approval_id_wait, state.config.approval_timeout)
+            .await;
         {
+            let mut inflight = state.inflight.lock().unwrap_or_else(|e| e.into_inner());
+            if inflight.get(&key) == Some(&approval_id_wait) {
+                inflight.remove(&key);
+            }
+        }
+        let decided = match waited {
             Ok(a) => a,
             Err(e) => return Ok(e.into()),
         };

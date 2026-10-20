@@ -566,32 +566,22 @@ async fn derived_idempotency_key_dedupes_identical_calls() {
 }
 
 #[tokio::test]
-async fn concurrent_same_key_executes_once() {
+async fn concurrent_same_key_shares_one_approval() {
     let h = Harness::start().await;
     let args = json!({"title": "race", "idempotency_key": "race-key"});
     let (a, b, _) = tokio::join!(
         h.call_tool("tasks_create", args.clone()),
         h.call_tool("tasks_create", args.clone()),
         async {
-            // approve whatever shows up until both calls finish
-            for _ in 0..100 {
-                let pend = h.get("/api/approvals?status=pending").await;
-                for p in pend.as_array().unwrap() {
-                    h.decide(p["id"].as_str().unwrap(), "approve", None).await;
-                }
-                let total = h.get("/api/approvals").await.as_array().unwrap().len();
-                let still = h
-                    .get("/api/approvals?status=pending")
-                    .await
-                    .as_array()
-                    .unwrap()
-                    .len();
-                if total >= 2 && still == 0 {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
+            let first = h.wait_pending().await;
+            // give the second call time to arrive; it must attach, not add a card
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let all = h.get("/api/approvals").await;
+            assert_eq!(all.as_array().unwrap().len(), 1, "one card for both calls");
+            let (s, _) = h
+                .decide(first["id"].as_str().unwrap(), "approve", None)
+                .await;
+            assert_eq!(s, 200);
         }
     );
     assert!(
@@ -600,6 +590,28 @@ async fn concurrent_same_key_executes_once() {
     );
     assert_eq!(h.tasks().await.len(), 1, "executed exactly once");
     assert_eq!(a["structuredContent"], b["structuredContent"]);
+    assert_eq!(h.get("/api/journal").await.as_array().unwrap().len(), 1);
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn concurrent_same_key_denial_reaches_both_callers() {
+    let h = Harness::start().await;
+    let args = json!({"title": "nope", "idempotency_key": "k2"});
+    let (a, b, _) = tokio::join!(
+        h.call_tool("tasks_create", args.clone()),
+        h.call_tool("tasks_create", args.clone()),
+        async {
+            let first = h.wait_pending().await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(h.get("/api/approvals").await.as_array().unwrap().len(), 1);
+            h.decide(first["id"].as_str().unwrap(), "deny", Some("no"))
+                .await;
+        }
+    );
+    assert_eq!(a["isError"], true);
+    assert_eq!(b["isError"], true);
+    assert!(h.tasks().await.is_empty());
     h.shutdown().await;
 }
 
@@ -1195,12 +1207,11 @@ async fn mcp_negotiates_protocol_versions_and_session_header() {
     for (asked, expect) in [
         ("2025-11-25", "2025-11-25"),
         ("2025-06-18", "2025-06-18"),
-        ("2099-01-01", "2099-01-01"),
-        ("2026-03-01", "2026-03-01"),
-        ("2025-03-26", "2025-06-18"),
-        ("garbage", "2025-06-18"),
-        ("2025-99-99", "2025-06-18"),
-        ("2024-11-05", "2025-06-18"),
+        ("2099-01-01", "2025-11-25"),
+        ("2026-03-01", "2025-11-25"),
+        ("2025-03-26", "2025-11-25"),
+        ("garbage", "2025-11-25"),
+        ("2024-11-05", "2025-11-25"),
     ] {
         let r = h
             .req(Method::POST, "/mcp")

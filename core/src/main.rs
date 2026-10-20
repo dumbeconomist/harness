@@ -19,7 +19,25 @@ async fn main() -> anyhow::Result<()> {
     }
     tracing::info!("workbench-core listening on http://{}", server.addr);
 
-    tokio::signal::ctrl_c().await?;
+    wait_for_shutdown_signal().await?;
+    tracing::info!("shutting down");
     server.shutdown().await;
+    Ok(())
+}
+
+/// Resolve on SIGINT, or SIGTERM on unix, so shutdown is always graceful
+/// (pending approvals are expired before exit).
+async fn wait_for_shutdown_signal() -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = signal(SignalKind::terminate())?;
+        tokio::select! {
+            r = tokio::signal::ctrl_c() => r?,
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await?;
     Ok(())
 }
