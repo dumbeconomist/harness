@@ -33,35 +33,61 @@ Full contracts (API, MCP tools, risk tiers, data model) are in [docs/architectur
 | `e2e/` | Playwright tests |
 | `docs/` | Architecture, rubric, scorecard |
 
-## Quickstart (macOS dev)
+## Quickstart (macOS)
 
-1. **Enable the Hermes API server.** Add these to `~/.hermes/.env`, then start the gateway:
+Workbench talks to a **dedicated, locked Hermes profile** (`workbench`, port 8643). In that profile
+Hermes's own terminal, file-write, code, browser and scheduling tools are switched off, so every action
+goes through Workbench's approval gate. Your normal `~/.hermes` profile is left untouched.
+Background and evidence: [`docs/hermes-integration.md` §9](docs/hermes-integration.md).
 
-   ```sh
-   API_SERVER_ENABLED=true
-   API_SERVER_KEY=<a-long-random-string>
-   ```
-
-   ```sh
-   hermes gateway
-   ```
-
-2. **Run the core** (terminal 1):
+1. **Create the locked profile** (idempotent: it never overwrites an existing config or key):
 
    ```sh
-   cargo run -p workbench-core
+   tools/hermes-spike/workbench-profile/setup-profile.sh
+   hermes -p workbench model          # choose the LLM for this profile
    ```
 
-3. **Run the web UI** (terminal 2):
+2. **Start Workbench.** Either open the app (the `.dmg` from the `macos-build` CI run; it is ad-hoc
+   signed, so right-click → Open the first time), or run the core directly:
 
    ```sh
-   pnpm -C web dev
+   cargo run -p workbench-core        # serves 127.0.0.1:8765
    ```
 
-   Or run the whole desktop app, shell included, with `cargo tauri dev`.
+   On first start Workbench writes two tokens to `~/Library/Application Support/Workbench/`:
+   `token` (for the UI, `/api` only) and `mcp_token` (for Hermes, `/mcp` only).
 
-No Hermes yet? Run `MOCK_HERMES_PORT=8643 node tools/mock-hermes/server.js` in place of the gateway.
-The core expects the locked Workbench profile on port 8643 by default; the mock's own default is 8642.
+3. **Connect Hermes to Workbench.** In Workbench, open **Settings → Connection**, reveal the snippet, and
+   put the MCP token in the profile's env file:
+
+   ```sh
+   echo "WORKBENCH_MCP_TOKEN=$(cat ~/Library/Application\ Support/Workbench/mcp_token)" \
+     >> ~/.hermes/profiles/workbench/.env
+   ```
+
+4. **Start the locked Hermes gateway**, then point Workbench at it:
+
+   ```sh
+   hermes -p workbench gateway run    # API server on 127.0.0.1:8643
+   ```
+
+   In **Settings → Hermes**, set the URL to `http://127.0.0.1:8643/v1` (the default) and paste the
+   `API_SERVER_KEY` from `~/.hermes/profiles/workbench/.env`. In the app it is stored in the Keychain.
+
+5. **Try it:** select a task, then in the Hermes pane type *"add a task to buy milk"*. An approval card
+   appears; approve it, then undo it from **Activity**.
+
+### Web UI dev loop (without the app shell)
+
+```sh
+cargo run -p workbench-core
+VITE_WORKBENCH_URL=http://127.0.0.1:8765 \
+VITE_WORKBENCH_TOKEN=$(cat ~/Library/Application\ Support/Workbench/token) \
+pnpm -C web dev
+```
+
+No Hermes yet? Run `MOCK_HERMES_PORT=8643 node tools/mock-hermes/server.js` in place of the gateway
+(the mock's own default port is 8642).
 
 ## Testing
 

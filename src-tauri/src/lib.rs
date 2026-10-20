@@ -81,9 +81,9 @@ pub fn run() {
             }
         })
         .setup(|app| {
-            // --- start core in-process on a random loopback port
+            // --- start core in-process. Keep core's default data dir (~/Library/Application Support/Workbench,
+            // or WORKBENCH_DATA_DIR) so the app and a standalone `workbench-core` share tokens and the database.
             let mut config = workbench_core::Config::from_env()?;
-            config.data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&config.data_dir)?;
             // Keychain only on macOS; elsewhere keys stay memory-only.
             #[cfg(target_os = "macos")]
