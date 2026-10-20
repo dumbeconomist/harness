@@ -487,3 +487,25 @@ test.describe('round-4 regressions: same-spot click cadences, list shifts', () =
     await Promise.all(calls.map((c) => c.promise));
   });
 });
+
+test.describe('round-4 layout: long approvals keep Approve/Deny reachable', () => {
+  for (const layout of ['docked', 'floating'] as const) {
+    test(`long notes update at 900x600 keeps decision buttons on-screen (${layout})`, async ({ page, request }) => {
+      await page.setViewportSize({ width: 900, height: 600 });
+      await page.goto('/');
+      if (layout === 'floating') await page.getByRole('button', { name: 'Hide Hermes pane' }).click();
+      const t = await createTask(request, `Long ${Date.now()}`);
+      const notes = 'A long agent rewrite of the notes. '.repeat(60);
+      const pending = callTool(request, 'tasks_update', { id: t.id, notes });
+      const card = page.getByTestId('approval-card');
+      await expect(card).toBeVisible();
+      const approve = card.getByTestId('approve-btn');
+      await expect(approve).toBeEnabled();
+      await expect(approve).toBeInViewport();
+      await expect(card.getByTestId('deny-btn')).toBeInViewport();
+      await page.screenshot({ path: shot(`21-long-card-${layout}`) });
+      await approve.click();
+      expect(toolText(await (await pending).json())).toContain(t.id);
+    });
+  }
+});

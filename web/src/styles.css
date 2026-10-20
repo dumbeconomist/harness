@@ -195,6 +195,14 @@ select { padding: 2px 4px; }
   position: fixed; top: 48px; right: 16px; z-index: 50; width: 380px; max-width: calc(100vw - 32px);
   background: var(--bg); border-radius: 12px; box-shadow: var(--shadow); padding: var(--s3) var(--s4) var(--s3);
   border-top: 4px solid var(--accent); animation: slide-in 0.22s ease-out;
+  /* Long arguments must never push the decision buttons off-screen: cap height, scroll the body. */
+  max-height: calc(100vh - 64px); overflow: auto; overscroll-behavior: contain;
+}
+.approval-card .ac-args { max-height: 30vh; overflow: auto; }
+/* Decision row stays visible at the bottom of the (scrolling) card in both layouts. */
+.approval-card .ac-actions {
+  position: sticky; bottom: calc(-1 * var(--s3)); z-index: 1;
+  background: var(--bg); padding-block: var(--s2) var(--s3); margin-bottom: calc(-1 * var(--s3));
 }
 .approval-card.tier-2 { border-top-color: var(--danger); }
 .ac-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
