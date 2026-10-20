@@ -128,7 +128,7 @@ Implication: do **not** build a generic Hermes chat/model-config/terminal UI. Wo
 
 ## 7. Open risks
 
-- **Hermes' built-in tools bypass the Workbench gate** (`terminal`, `write_file`, `patch`, `execute_code`, `browser_*`, `cronjob`, `delegate_task`, `memory`, `skill_manage`; all ✅ offered to the LLM). Mitigations to evaluate (❓ untested): `hermes tools` / `platform_toolsets` / `agent.disabled_toolsets` config to restrict the api_server platform to MCP + read-only tools; a dedicated profile; keeping `approvals.mode` at `smart`/`manual` with `unattended_mode: deny`. The docs warn the API server "gives full access to hermes-agent's toolset, including terminal commands". Decide product stance before milestone 1 ships.
+
 - **Version drift**: the docs and 0.19.0 disagree already (tool prefix, key length, `jobs_admin`). The project moves very fast (breaking auth change July 2026). Pin/record `GET /health`.version and `/v1/capabilities` at startup and feature-detect (`features.*`, `session_continuity_header`).
 - **Install friction**: pip wheel lacks `mcp`/`aiohttp`; Python >= 3.11; macOS users likely use the official installer/Desktop. Hermes needs a configured LLM provider (`hermes setup`); without it the API server accepts requests but chat fails (❓ exact error not captured).
 - **Two prompts / double gating** if user sets `trust: untrusted`; **prompt-cache invalidation** when tool schemas change (`/reload-mcp`) — avoid dynamic `tools/list` changes.
@@ -138,3 +138,54 @@ Implication: do **not** build a generic Hermes chat/model-config/terminal UI. Wo
 ## 8. Reproduce
 
 `tools/hermes-spike/run.sh` (see its README). Exact config used is in `tools/hermes-spike/example-home/`. Environment: Linux, Python 3.13, `hermes-agent 0.19.0`, `mcp 1.26.0`, `aiohttp 3.14.1`, `HERMES_HOME` under `/tmp` (nothing touched `~/.hermes`).
+
+## 9. Locked Workbench profile (decided)
+
+Decision: Workbench runs its own Hermes **profile** (`workbench`, API port **8643**, own key) with every built-in write/exec tool removed. Only the Workbench MCP server and a few read-only built-ins are offered. Default profile `~/.hermes` is untouched. Ready-made files: `tools/hermes-spike/workbench-profile/{config.yaml,env.example,setup-profile.sh}`.
+
+### Mechanism (✅ verified on 0.19.0)
+- Profile = directory `~/.hermes/profiles/<name>/` with its own `config.yaml`, `.env`, memories, skills, cron, sessions (📄 docs:profiles; ✅ `hermes profile create workbench --no-alias --no-skills` created it; no `--clone`, so no keys/memory copied). Run it with `hermes -p workbench gateway run` (✅). The profile's `.env` carries its own `API_SERVER_PORT/KEY` (✅ served on 8643).
+- Tool selection = `platform_toolsets.api_server: [..]` (allow-list of toolset names, platform key `api_server`; source `toolsets.py` defines default `hermes-api-server` = everything) **plus** `agent.disabled_toolsets: [..]` (authoritative deny-list applied after, 📄 docs:configuration "Global Toolset Disable"). I used both; ❓ I did not test each alone.
+- Granularity limit: `file` bundles `read_file`+`write_file`+`patch`+`search_files`, and `skills` bundles `skills_list`/`skill_view` with `skill_manage`; `memory` is one tool for read+write. They can only be dropped whole, so **no file read and no skill/memory tool** in the locked profile. (Memory files may still be injected into the system prompt read-only — ❓ not verified with `memory` disabled.)
+- `web` (web_search/web_extract) is allowed but only appears when a web backend is configured (✅ absent in the spike because none was).
+
+### Config (exact, in `tools/hermes-spike/workbench-profile/config.yaml`)
+```yaml
+platform_toolsets:
+  api_server: [web, vision, session_search]   # verified run included `todo`; removed afterwards so tasks live only in Workbench
+agent:
+  disabled_toolsets: [terminal, file, code_execution, delegation, browser, cronjob, skills, memory, tts, image_gen, kanban, computer_use, clarify]
+approvals: {mode: manual, unattended_mode: deny, timeout: 300}
+mcp_servers:
+  workbench:
+    url: http://127.0.0.1:8765/mcp
+    headers: {Authorization: "Bearer ${WORKBENCH_TOKEN}"}
+    timeout: 600
+    connect_timeout: 30
+```
+`.env`: `API_SERVER_ENABLED=true`, `API_SERVER_HOST=127.0.0.1`, `API_SERVER_PORT=8643`, `API_SERVER_KEY=<openssl rand -hex 32>`, `WORKBENCH_TOKEN=<core token>`. Choose the LLM with `hermes -p workbench model`.
+
+### Setup (macOS or Linux)
+```bash
+tools/hermes-spike/workbench-profile/setup-profile.sh     # WORKBENCH_TOKEN=... optional; PROFILE / HERMES_PORT overridable
+hermes -p workbench model
+hermes -p workbench gateway run
+```
+✅ Script tested (on Linux with a fake `$HOME`): creates the profile, writes config only if absent, creates `.env` mode 600, sets only missing keys, generates the API key once; second run changes nothing. ❓ Not run on macOS (uses `openssl`, `cp`, `grep`, bash 3.2-compatible constructs). Caveat: any `hermes` command creates `kanban.db` and `logs/` in `~/.hermes` itself; nothing else in the default profile is touched.
+
+### Evidence: tools offered to the LLM (request-body `tools[]` captured by `fake_llm.py`)
+Before (default profile, no restriction), 27 tools:
+`browser_back, browser_click, browser_console, browser_get_images, browser_navigate, browser_press, browser_scroll, browser_snapshot, browser_type, browser_vision, cronjob, delegate_task, execute_code, mcp__workbench__tasks_create, memory, patch, process, read_file, search_files, session_search, skill_manage, skill_view, skills_list, terminal, todo, vision_analyze, write_file`
+
+After (`-p workbench`), 4 tools:
+`mcp__workbench__tasks_create, session_search, todo, vision_analyze`
+
+- ✅ Workbench MCP tool still offered and called (fake MCP log showed `tools/call tasks_create`, bearer accepted, final answer returned).
+- ✅ Forced hallucinated calls (fake LLM emits `terminal` with `touch .../PWNED_terminal`, then `write_file`): Hermes returned `Tool 'terminal' does not exist. Available tools: mcp__workbench__tasks_create, session_search, todo, vision_analyze` (same for `write_file`); no file was created.
+- ✅ `GET /v1/toolsets` on the profile reports `terminal`, `file`, `browser` as `enabled:false`.
+
+### Remaining ❓
+- Whether future Hermes updates add new toolsets that `platform_toolsets` (allow-list) would not include: allow-list design makes this safe; keep `disabled_toolsets` as backstop. Re-capture `tools[]` after each Hermes upgrade (add to e2e/smoke).
+- `web_search`/`web_extract`/`vision_analyze` can fetch arbitrary URLs/images (read-only but network egress and prompt-injection surface); drop `web` and `vision` from `platform_toolsets.api_server` for a stricter profile.
+- MCP tools from *other* servers the user adds to this profile's config would also be offered; the profile should contain only `workbench`.
+- Cron/skills/memory in this profile are inert (`cronjob`, `skill_manage`, `memory` tools absent); jobs created via the REST `/api/jobs` endpoint (✅ works with the API key) still run an agent with the cron toolset — restrict via `platform_toolsets.cron` ❓ untested.

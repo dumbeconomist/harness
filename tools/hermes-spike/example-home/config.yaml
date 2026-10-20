@@ -1,0 +1,13 @@
+# Spike config: fake LLM + Workbench MCP. Copy to $HERMES_HOME/config.yaml.
+model:
+  provider: custom
+  default: fake-model
+  base_url: http://127.0.0.1:9100/v1
+  api_key: fake
+mcp_servers:
+  workbench:
+    url: http://127.0.0.1:8765/mcp
+    headers:
+      Authorization: "Bearer ${WORKBENCH_TOKEN}"
+    timeout: 600          # tool-call timeout (default 300 == our approval timeout)
+    connect_timeout: 30

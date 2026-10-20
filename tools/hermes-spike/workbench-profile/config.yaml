@@ -1,0 +1,43 @@
+# Hermes "workbench" profile — locked: Workbench MCP + read-only built-ins only.
+# Installed to ~/.hermes/profiles/workbench/config.yaml by setup-profile.sh (only if absent).
+# Choose your LLM with:  hermes -p workbench model     (do not edit model: by hand unless you know why)
+
+# Which built-in toolsets the API-server platform may offer. Allow-list.
+# web = web_search/web_extract; vision = vision_analyze; session_search; todo (in-memory planning).
+# Everything with write/exec side effects is simply absent: terminal/process, file (read+write+patch are one
+# toolset), execute_code, delegation, browser*, cronjob, skills (skill_manage shares the toolset), memory, tts, image_gen, kanban.
+platform_toolsets:
+  # `todo` omitted on purpose: tasks live in Workbench (gated, journaled), not Hermes's own list.
+  api_server: [web, vision, session_search]
+
+# Authoritative deny-list: applied AFTER platform_toolsets, survives `hermes tools` / `hermes update` re-seeding.
+agent:
+  disabled_toolsets:
+    - terminal
+    - file
+    - code_execution
+    - delegation
+    - browser
+    - cronjob
+    - skills
+    - memory
+    - tts
+    - image_gen
+    - kanban
+    - computer_use
+    - clarify
+
+# Hermes-native dangerous-command prompts: belt and braces (terminal is already absent).
+approvals:
+  mode: manual
+  unattended_mode: deny
+  timeout: 300
+
+mcp_servers:
+  workbench:
+    url: http://127.0.0.1:8765/mcp
+    headers:
+      Authorization: "Bearer ${WORKBENCH_TOKEN}"
+    timeout: 600          # > WORKBENCH_APPROVAL_TIMEOUT_SECS (300)
+    connect_timeout: 30
+    # trust: full         # default; Workbench is the approval gate
