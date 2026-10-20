@@ -1,0 +1,19 @@
+{
+  "name": "mock-hermes",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Dependency-free mock of Hermes Agent's OpenAI-compatible API server",
+  "type": "module",
+  "main": "server.js",
+  "bin": {
+    "mock-hermes": "server.js"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "UNLICENSED"
+}
