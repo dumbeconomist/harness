@@ -36,6 +36,7 @@ pub struct RunningServer {
     pub token: String,
     /// MCP token (`/mcp` only).
     pub mcp_token: String,
+    approvals: Arc<approvals::Approvals>,
     shutdown_flag: watch::Sender<bool>,
     shutdown_tx: oneshot::Sender<()>,
     join: JoinHandle<()>,
@@ -44,6 +45,8 @@ pub struct RunningServer {
 impl RunningServer {
     /// Stop accepting connections, end SSE streams and wait (briefly) for exit.
     pub async fn shutdown(self) {
+        // Release tool calls blocked on a human before closing connections.
+        self.approvals.expire_all_pending(tools::SHUTDOWN_NOTE);
         let _ = self.shutdown_flag.send(true);
         let _ = self.shutdown_tx.send(());
         let mut join = self.join;
@@ -148,6 +151,7 @@ pub async fn serve(config: Config) -> anyhow::Result<RunningServer> {
     let addr = listener.local_addr()?;
 
     let (flag_tx, flag_rx) = watch::channel(false);
+    let approvals_handle = approvals.clone();
     let state = Arc::new(state::AppState {
         db,
         events,
@@ -180,6 +184,7 @@ pub async fn serve(config: Config) -> anyhow::Result<RunningServer> {
         addr,
         token,
         mcp_token,
+        approvals: approvals_handle,
         shutdown_flag: flag_tx,
         shutdown_tx: tx,
         join,

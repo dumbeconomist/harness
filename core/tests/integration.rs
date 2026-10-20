@@ -1195,7 +1195,11 @@ async fn mcp_negotiates_protocol_versions_and_session_header() {
     for (asked, expect) in [
         ("2025-11-25", "2025-11-25"),
         ("2025-06-18", "2025-06-18"),
-        ("2099-01-01", "2025-06-18"),
+        ("2099-01-01", "2099-01-01"),
+        ("2026-03-01", "2026-03-01"),
+        ("2025-03-26", "2025-06-18"),
+        ("garbage", "2025-06-18"),
+        ("2025-99-99", "2025-06-18"),
         ("2024-11-05", "2025-06-18"),
     ] {
         let r = h
@@ -1526,6 +1530,15 @@ async fn unknown_tool_fields_are_rejected() {
         .call_tool("tasks_create", json!({"title": "x", "priority": "high"}))
         .await;
     assert_eq!(r["isError"], true);
+    // goal_id is not part of the tool schemas until goals exist
+    let r = h
+        .call_tool("tasks_create", json!({"title": "x", "goal_id": "g1"}))
+        .await;
+    assert_eq!(r["isError"], true);
+    let tools = h
+        .mcp(json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+        .await;
+    assert!(!tools.to_string().contains("goal_id"));
     assert!(h.tasks().await.is_empty());
     // the REST API tolerates a whole Task echoed back
     let (s, t) = h
@@ -1863,4 +1876,90 @@ async fn hermes_key_without_secret_store_is_memory_only() {
     let (_, v) = h.put("/api/settings/hermes", json!({"api_key": ""})).await;
     assert_eq!(v["has_key"], false);
     h.shutdown().await;
+}
+
+#[tokio::test]
+async fn changing_hermes_host_requires_explicit_key() {
+    let fake = fake_hermes("hermes-agent", None).await;
+    let h = Harness::start().await; // starts with key "hermes-secret" at 127.0.0.1:1
+    let (s, v) = h
+        .put("/api/settings/hermes", json!({"url": fake.url}))
+        .await;
+    assert_eq!(s, 400);
+    assert_eq!(v["error"]["code"], "key_required_for_new_host");
+    // nothing changed
+    let cur = h.get("/api/settings/hermes").await;
+    assert_eq!(cur["url"], "http://127.0.0.1:1/v1");
+    assert_eq!(cur["has_key"], true);
+    // chat still goes to the old (dead) host, and the fake never saw a key
+    assert!(fake.captured.lock().unwrap().requests.is_empty());
+
+    // same origin, different path: no key needed
+    let (s, v) = h
+        .put(
+            "/api/settings/hermes",
+            json!({"url": "http://127.0.0.1:1/other"}),
+        )
+        .await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["has_key"], true);
+
+    // new host with explicit key works; explicit "" clears
+    let (s, v) = h
+        .put(
+            "/api/settings/hermes",
+            json!({"url": fake.url, "api_key": "new-key"}),
+        )
+        .await;
+    assert_eq!(s, 200);
+    assert_eq!(v["has_key"], true);
+    let (s, v) = h
+        .put(
+            "/api/settings/hermes",
+            json!({"url": "http://127.0.0.1:1/v1", "api_key": ""}),
+        )
+        .await;
+    assert_eq!(s, 200);
+    assert_eq!(v["has_key"], false);
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn shutdown_expires_pending_approvals_and_unblocks_calls() {
+    let h = Harness::start().await; // 30s approval timeout
+    let (client, url, token) = (h.client.clone(), h.url("/mcp"), h.mcp_token.clone());
+    let call = tokio::spawn(async move {
+        client
+            .post(url)
+            .bearer_auth(token)
+            .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":"tasks_create","arguments":{"title":"never"}}}))
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap()
+    });
+    h.wait_pending().await;
+    let started = std::time::Instant::now();
+    let db_path = h.dir.path().join("workbench.db");
+    h.server.shutdown().await;
+    let v = tokio::time::timeout(Duration::from_secs(5), call)
+        .await
+        .expect("blocked call must return on shutdown")
+        .unwrap();
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert_eq!(v["result"]["isError"], true);
+    let text = v["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.to_lowercase().contains("expired"), "{text}");
+    let conn = rusqlite::Connection::open(db_path).unwrap();
+    let status: String = conn
+        .query_row("SELECT status FROM approvals", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(status, "expired");
+    let n: i64 = conn
+        .query_row("SELECT count(*) FROM tasks", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 0);
 }

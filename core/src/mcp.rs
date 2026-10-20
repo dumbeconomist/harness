@@ -11,7 +11,20 @@ use crate::state::SharedState;
 use crate::tools::{self, ToolResult};
 
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
-const SUPPORTED_VERSIONS: [&str; 2] = ["2025-06-18", "2025-11-25"];
+/// Echo any well-formed date version at or after the baseline; older or
+/// malformed values fall back to the baseline.
+fn negotiate_version(requested: Option<&str>) -> &str {
+    match requested {
+        Some(v)
+            if chrono::NaiveDate::parse_from_str(v, "%Y-%m-%d").is_ok()
+                && v.len() == 10
+                && v >= PROTOCOL_VERSION =>
+        {
+            v
+        }
+        _ => PROTOCOL_VERSION,
+    }
+}
 
 pub const PARSE_ERROR: i64 = -32700;
 pub const INVALID_REQUEST: i64 = -32600;
@@ -91,9 +104,7 @@ pub async fn handle_message(state: &SharedState, msg: Value) -> Option<Value> {
     Some(match method {
         "initialize" => {
             let requested = params.get("protocolVersion").and_then(Value::as_str);
-            let version = requested
-                .filter(|v| SUPPORTED_VERSIONS.contains(v))
-                .unwrap_or(PROTOCOL_VERSION);
+            let version = negotiate_version(requested);
             rpc_result(
                 id,
                 json!({
@@ -181,6 +192,22 @@ mod tests {
         for t in tools {
             assert_eq!(t["inputSchema"]["type"], "object");
             assert!(t["description"].as_str().unwrap().contains("tier"));
+        }
+    }
+
+    #[test]
+    fn version_negotiation() {
+        for (asked, want) in [
+            (Some("2025-06-18"), "2025-06-18"),
+            (Some("2025-11-25"), "2025-11-25"),
+            (Some("2026-03-01"), "2026-03-01"),
+            (Some("2025-03-26"), "2025-06-18"),
+            (Some("2025-13-40"), "2025-06-18"),
+            (Some("latest"), "2025-06-18"),
+            (Some("2099-1-1"), "2025-06-18"),
+            (None, "2025-06-18"),
+        ] {
+            assert_eq!(negotiate_version(asked), want, "{asked:?}");
         }
     }
 

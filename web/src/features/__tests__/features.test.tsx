@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { ApprovalCard } from '../approvals/ApprovalCard';
 import { TasksView } from '../tasks/TasksView';
 import { JournalView, UndoButton } from '../journal/JournalView';
+import { ApprovalsView } from '../approvals/ApprovalsView';
 import { LedgerView } from '../ledger/LedgerView';
 import { TaskDetail } from '../tasks/TaskDetail';
 import { SettingsView } from '../settings/SettingsView';
@@ -276,6 +277,59 @@ function within2(el: HTMLElement) {
     queryByText: (t: string) => Array.from(el.querySelectorAll('option')).find((o) => o.textContent === t) ?? null,
   };
 }
+
+describe('tier-2 keyboard hardening', () => {
+  const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  it('Review then Enter,Enter / Space does not approve; focus leaves the button', async () => {
+    const onDecide = vi.fn().mockResolvedValue(undefined);
+    render(<ApprovalCard approval={approval({ tier: 2, tool: 'tasks_delete', args_json: '{"id":"t1"}' })} pendingCount={1} guardMs={80} tasks={[task()]} onDecide={onDecide} />);
+    await wait(120);
+    const review = screen.getByTestId('review-btn');
+    review.focus();
+    await userEvent.keyboard('{Enter}');
+    await wait(10);
+    expect(screen.getByTestId('approval-card')).toHaveFocus();
+    await userEvent.keyboard('{Enter}{Enter} {Enter>4/}');
+    expect(onDecide).not.toHaveBeenCalled();
+    expect(screen.getByTestId('approve-btn')).toBeDisabled(); // re-armed
+    await wait(120);
+    await userEvent.keyboard('{Enter} {Enter}');
+    expect(onDecide).not.toHaveBeenCalled();
+  });
+  it('keyboard-activated Approve click (detail 0) is ignored for tier 2, pointer click works', async () => {
+    const onDecide = vi.fn().mockResolvedValue(undefined);
+    render(<ApprovalCard approval={approval({ tier: 2 })} pendingCount={1} guardMs={0} onDecide={onDecide} />);
+    await userEvent.click(screen.getByTestId('review-btn'));
+    fireEvent.click(screen.getByTestId('approve-btn'), { detail: 0 });
+    expect(onDecide).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByTestId('approve-btn'));
+    expect(onDecide).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('ApprovalsView guards', () => {
+  const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  it('double-click on row 1 cannot approve row 2; rows are inert after a decision', async () => {
+    const onDecide = vi.fn().mockResolvedValue(undefined);
+    render(<ApprovalsView guardMs={100} onDecide={onDecide} approvals={[approval({ id: 'a1' }), approval({ id: 'a2' })]} />);
+    expect(screen.getAllByTestId('row-approve')[0]).toBeDisabled(); // armed after mount
+    await wait(140);
+    await userEvent.dblClick(screen.getAllByTestId('row-approve')[0]!);
+    expect(onDecide).toHaveBeenCalledTimes(1);
+    expect(onDecide).toHaveBeenCalledWith('a1', 'approve');
+    expect(screen.getAllByTestId('row-approve')[1]).toBeDisabled();
+  });
+  it('tier-2 row: Review then Enter,Enter does not approve', async () => {
+    const onDecide = vi.fn().mockResolvedValue(undefined);
+    render(<ApprovalsView guardMs={60} onDecide={onDecide} approvals={[approval({ tier: 2, tool: 'tasks_delete' })]} />);
+    await wait(100);
+    screen.getByTestId('row-review').focus();
+    await userEvent.keyboard('{Enter}');
+    await wait(10);
+    await userEvent.keyboard('{Enter}{Enter}');
+    expect(onDecide).not.toHaveBeenCalled();
+  });
+});
 
 describe('LedgerView', () => {
   it('shows tokens and unpriced badges', () => {

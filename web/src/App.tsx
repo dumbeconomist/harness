@@ -29,6 +29,7 @@ export function App() {
   const [chatOpen, setChatOpen] = useState(true);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
+  const [highlightId, setHighlightId] = useState<string | null>(null);
 
   const selected = data.tasks.find((t) => t.id === selectedId) ?? null;
   const topApproval = data.approvals[0] ?? null;
@@ -153,28 +154,25 @@ export function App() {
           id: 'focus-approval',
           title: 'Review pending approval',
           hint: '⌘⇧A',
-          keywords: 'approval card focus',
+          keywords: 'approve deny approval card focus',
           run: () => window.setTimeout(() => window.dispatchEvent(new Event('workbench:focus-approval')), 50),
-        },
-        ...(topApproval.tier >= 2
-          ? []
-          : [
-        {
-          id: 'approve-top',
-          title: `Approve: ${topApproval.summary || topApproval.tool}`,
-          keywords: 'approve top pending yes',
-          run: () => void decide(topApproval.id, 'approve').catch((e) => flash(String(e))),
-        }]),
-        {
-          id: 'deny-top',
-          title: `Deny: ${topApproval.summary || topApproval.tool}`,
-          keywords: 'deny top pending no reject',
-          run: () => void decide(topApproval.id, 'deny').catch((e) => flash(String(e))),
-        },
+        }
       );
     }
     return list;
-  }, [goto, chatOpen, topApproval, decide, flash]);
+  }, [goto, chatOpen, topApproval]);
+
+  const approvalCard = (docked: boolean) =>
+    topApproval && (
+      <ApprovalCard
+        key={`${topApproval.id}:${docked}`}
+        docked={docked}
+        approval={topApproval}
+        tasks={data.tasks}
+        pendingCount={data.approvals.length}
+        onDecide={(d, note) => decide(topApproval.id, d, note)}
+      />
+    );
 
   return (
     <div className={`app${chatOpen ? '' : ' chat-collapsed'}`}>
@@ -259,10 +257,15 @@ export function App() {
           />
         )}
         {view === 'approvals' && (
-          <ApprovalsView approvals={data.approvals} tasks={data.tasks} onDecide={(id, d) => decide(id, d).catch((e) => flash(String(e)))} />
+          <ApprovalsView approvals={data.approvals} tasks={data.tasks} highlightId={highlightId} onDecide={(id, d) => decide(id, d).catch((e) => flash(String(e)))} />
         )}
         {view === 'journal' && (
-          <JournalView entries={data.journal} onUndo={undo} onOpenApproval={() => setView('approvals')} />
+          <JournalView entries={data.journal} onUndo={undo} onOpenApproval={(id) => {
+              if (data.approvals.some((a) => a.id === id)) {
+                setHighlightId(id);
+                setView('approvals');
+              } else flash('That approval has already been decided.');
+            }} />
         )}
         {view === 'ledger' && <LedgerView summary={data.ledger} />}
         {view === 'settings' && <SettingsView api={api} health={data.health} onRefreshHealth={() => void refresh.health()} />}
@@ -275,17 +278,10 @@ export function App() {
         hidden={!chatOpen}
         onOpenSettings={() => setView('settings')}
         onClose={() => setChatOpen(false)}
+        slot={chatOpen ? approvalCard(true) : null}
       />
+      {!chatOpen && approvalCard(false)}
 
-      {topApproval && !paletteOpen && (
-        <ApprovalCard
-          key={topApproval.id}
-          approval={topApproval}
-          tasks={data.tasks}
-          pendingCount={data.approvals.length}
-          onDecide={(d, note) => decide(topApproval.id, d, note)}
-        />
-      )}
       <CommandPalette open={paletteOpen} actions={actions} onClose={() => setPaletteOpen(false)} />
       {toast && (
         <div className="toast" role="status">

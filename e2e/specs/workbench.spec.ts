@@ -1,7 +1,7 @@
 import { expect, test } from '@playwright/test';
 import fs from 'node:fs';
 import path from 'node:path';
-import { callTool, createTask, listTaskTitles, pendingApprovals, toolText } from './helpers';
+import { callTool, createTask, denyAll, listTaskTitles, pendingApprovals, toolText } from './helpers';
 
 const SHOTS = path.resolve(__dirname, '../screenshots');
 fs.mkdirSync(SHOTS, { recursive: true });
@@ -283,4 +283,114 @@ test('settings: Hermes form, connection reveal, disabled permissions', async ({ 
   await expect(page.getByTestId('mcp-snippet')).toContainText('e2e-mcp-token');
   await expect(page.getByRole('switch', { name: /Web access/ })).toBeDisabled();
   await page.screenshot({ path: shot('15-settings-hermes') });
+});
+
+test.describe('round-3 regressions: Review→Approve focus, list double-click, palette', () => {
+  async function arm(request: Parameters<typeof callTool>[0]) {
+    const title = `Precious ${Date.now()}`;
+    const task = await createTask(request, title);
+    return { title, task, pending: callTool(request, 'tasks_delete', { id: task.id }) };
+  }
+  async function stillPending(request: Parameters<typeof callTool>[0], title: string) {
+    await new Promise((r) => setTimeout(r, 900)); // longer than the 600ms re-arm
+    expect((await pendingApprovals(request)).some((a) => a.tool === 'tasks_delete')).toBe(true);
+    expect(await listTaskTitles(request)).toContain(title);
+  }
+
+  test('focus Review, Enter, Enter does not approve', async ({ page, request }) => {
+    await page.goto('/');
+    const { title, pending } = await arm(request);
+    const card = page.getByTestId('approval-card');
+    await expect(card).toBeVisible();
+    await page.waitForTimeout(800);
+    await card.getByTestId('review-btn').focus();
+    await page.keyboard.press('Enter');
+    await page.keyboard.press('Enter');
+    await page.keyboard.press('Enter');
+    await stillPending(request, title);
+    await denyAll(request);
+    await pending;
+  });
+
+  test('hold Enter on focused Review does not approve', async ({ page, request }) => {
+    await page.goto('/');
+    const { title, pending } = await arm(request);
+    const card = page.getByTestId('approval-card');
+    await expect(card).toBeVisible();
+    await page.waitForTimeout(800);
+    await card.getByTestId('review-btn').focus();
+    for (let i = 0; i < 12; i++) {
+      await page.keyboard.down('Enter');
+      await page.waitForTimeout(30);
+    }
+    await page.keyboard.up('Enter');
+    await stillPending(request, title);
+    await denyAll(request);
+    await pending;
+  });
+
+  test('mouse-click Review then Space does not approve', async ({ page, request }) => {
+    await page.goto('/');
+    const { title, pending } = await arm(request);
+    const card = page.getByTestId('approval-card');
+    await expect(card).toBeVisible();
+    await page.waitForTimeout(800);
+    await card.getByTestId('review-btn').click();
+    await page.keyboard.press('Space');
+    await page.keyboard.press('Space');
+    await stillPending(request, title);
+    await page.screenshot({ path: shot('16-review-rearmed') });
+    await denyAll(request);
+    await pending;
+  });
+
+  test('Approvals list: tier-2 Review, Enter, Enter does not approve', async ({ page, request }) => {
+    await page.goto('/');
+    const { title, pending } = await arm(request);
+    await expect(page.getByTestId('approval-card')).toBeVisible();
+    await page.getByRole('button', { name: /Approvals/ }).click();
+    await page.waitForTimeout(800);
+    await page.getByTestId('row-review').focus();
+    await page.keyboard.press('Enter');
+    await page.keyboard.press('Enter');
+    await page.keyboard.press('Enter');
+    await stillPending(request, title);
+    await denyAll(request);
+    await pending;
+  });
+
+  test('Approvals list: double-click on row 1 does not approve row 2', async ({ page, request }) => {
+    await page.goto('/');
+    const a = await createTask(request, `Victim A ${Date.now()}`);
+    const b = await createTask(request, `Victim B ${Date.now()}`);
+    const p1 = callTool(request, 'tasks_update', { id: a.id, title: `${a.title} (renamed)` });
+    await expect.poll(async () => (await pendingApprovals(request)).length).toBe(1);
+    const p2 = callTool(request, 'tasks_update', { id: b.id, title: `${b.title} (renamed)` });
+    await expect.poll(async () => (await pendingApprovals(request)).length).toBe(2);
+    await page.getByRole('button', { name: /Approvals/ }).click();
+    await expect(page.getByTestId('approval-row')).toHaveCount(2);
+    await page.waitForTimeout(800);
+    await page.screenshot({ path: shot('17-approvals-list') });
+    await page.getByTestId('row-approve').first().dblclick();
+    await page.waitForTimeout(900);
+    expect((await pendingApprovals(request)).length).toBe(1);
+    await denyAll(request);
+    await Promise.all([p1, p2]);
+  });
+
+  test('palette has no approve/deny actions, only Review pending approval', async ({ page, request }) => {
+    await page.goto('/');
+    const { pending } = await arm(request);
+    await expect(page.getByTestId('approval-card')).toBeVisible();
+    await page.keyboard.press('Control+k');
+    const box = page.getByRole('textbox', { name: 'Command', exact: true });
+    await box.fill('approve');
+    await expect(page.getByRole('option', { name: /Review pending approval/ })).toBeVisible();
+    await expect(page.getByRole('option', { name: /^Approve/ })).toHaveCount(0);
+    await box.fill('deny');
+    await expect(page.getByRole('option', { name: /^Deny/ })).toHaveCount(0);
+    await page.keyboard.press('Escape');
+    await denyAll(request);
+    await pending;
+  });
 });

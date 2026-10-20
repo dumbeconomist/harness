@@ -237,6 +237,16 @@ async fn put_hermes(
     ApiJson(body): ApiJson<HermesBody>,
 ) -> ApiResult<Json<Value>> {
     let mut cur = st.hermes();
+    if let Some(u) = &body.url {
+        let new_origin = origin_of(u.trim());
+        if new_origin.is_some() && new_origin != origin_of(&cur.url) && body.api_key.is_none() {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "key_required_for_new_host",
+                "changing the Hermes host requires an explicit api_key (use \"\" to clear it); the old key is never sent to a new host",
+            ));
+        }
+    }
     if let Some(u) = body.url {
         let u = u.trim().trim_end_matches('/').to_string();
         if !(u.starts_with("http://") || u.starts_with("https://")) || u.len() < 9 {
@@ -267,6 +277,33 @@ async fn put_hermes(
     Ok(Json(hermes_view(&st).await))
 }
 
+/// `scheme://host:port` (lowercase, default ports filled in) or `None` if not http(s).
+fn origin_of(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    let scheme = scheme.to_ascii_lowercase();
+    let default_port = match scheme.as_str() {
+        "http" => 80,
+        "https" => 443,
+        _ => return None,
+    };
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let hostport = authority.rsplit('@').next()?.to_ascii_lowercase();
+    if hostport.is_empty() {
+        return None;
+    }
+    let has_port = match hostport.rfind(':') {
+        Some(i) => {
+            !hostport[i..].contains(']') && hostport[i + 1..].bytes().all(|b| b.is_ascii_digit())
+        }
+        None => false,
+    };
+    Some(if has_port {
+        format!("{scheme}://{hostport}")
+    } else {
+        format!("{scheme}://{hostport}:{default_port}")
+    })
+}
+
 async fn get_connection(State(st): State<SharedState>) -> Json<Value> {
     let url = st.mcp_url();
     let snippet = format!(
@@ -293,7 +330,7 @@ async fn list_tasks(
 /// Keep only the editable task fields (clients may send a whole Task back).
 fn pick_task_fields(body: &Value, id: Option<&str>) -> Value {
     let mut out = serde_json::Map::new();
-    for k in ["title", "notes", "status", "goal_id"] {
+    for k in ["title", "notes", "status"] {
         if let Some(v) = body.get(k).filter(|v| !v.is_null()) {
             out.insert(k.into(), v.clone());
         }
@@ -395,6 +432,7 @@ async fn undo_journal(
     Path(id): Path<String>,
 ) -> ApiResult<Json<journal::JournalEntry>> {
     let out = st.db.with(|c| journal::undo(c, &id))?;
+    tracing::info!(journal_id = %id, "undo applied");
     let (op, tid, task) = &out.task_change;
     st.events
         .emit("task.changed", json!({"op": op, "id": tid, "task": task}));
@@ -608,6 +646,32 @@ mod tests {
         ] {
             assert!(!origin_is_local(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn origins_of_urls() {
+        assert_eq!(
+            origin_of("http://localhost/v1"),
+            origin_of("HTTP://localhost:80/other")
+        );
+        assert_eq!(
+            origin_of("https://a.com/x").as_deref(),
+            Some("https://a.com:443")
+        );
+        assert_ne!(
+            origin_of("http://a.com:1/v1"),
+            origin_of("http://a.com:2/v1")
+        );
+        assert_ne!(origin_of("http://a.com/v1"), origin_of("https://a.com/v1"));
+        assert_eq!(
+            origin_of("http://u:p@a.com:9/x").as_deref(),
+            Some("http://a.com:9")
+        );
+        assert_eq!(
+            origin_of("http://[::1]:8643/v1").as_deref(),
+            Some("http://[::1]:8643")
+        );
+        assert_eq!(origin_of("ftp://a"), None);
     }
 
     #[test]

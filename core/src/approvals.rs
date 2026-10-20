@@ -182,6 +182,7 @@ impl Approvals {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(a.id.clone(), tx);
+        tracing::info!(approval_id = %a.id, tool = %a.tool, tier = a.tier, "approval created");
         self.events.emit("approval.created", json!(a));
         Ok(a)
     }
@@ -214,8 +215,21 @@ impl Approvals {
         {
             tx.send_replace(Some(status.to_string()));
         }
+        tracing::info!(approval_id = %a.id, tool = %a.tool, tier = a.tier, decision = %status, "approval decided");
         self.events.emit("approval.decided", json!(a));
         Ok(Some(a))
+    }
+
+    /// Expire every pending approval now (used on shutdown) so blocked calls return.
+    pub fn expire_all_pending(&self, note: &str) {
+        let ids: Vec<String> = self
+            .db
+            .with(|c| list(c, Some("pending")))
+            .map(|v| v.into_iter().map(|a| a.id).collect())
+            .unwrap_or_default();
+        for id in ids {
+            let _ = self.expire_if_pending(&id, note);
+        }
     }
 
     /// Approve or deny a pending approval.

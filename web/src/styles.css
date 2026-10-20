@@ -247,3 +247,9 @@ select { padding: 2px 4px; }
 .conn pre { white-space: pre-wrap; overflow-wrap: anywhere; font: 11px var(--mono); background: var(--bg-elev); padding: 8px; border-radius: 6px; border: 1px solid var(--border); }
 .field { display: grid; gap: 4px; margin: var(--s2) 0; }
 .chip.failed { color: var(--danger); background: var(--danger-soft); }
+
+.chat-slot { padding: 0 var(--s2); }
+.approval-card.docked { position: static; width: auto; max-width: none; margin: var(--s2) 0; box-shadow: none; border: 1px solid var(--border); border-top-width: 4px; animation: none; max-height: 55vh; overflow: auto; }
+.approval-badge.docked { position: static; display: block; margin: var(--s2) 0; width: 100%; box-shadow: none; }
+.card.highlight { outline: 2px solid var(--accent); }
+.btn:disabled.primary { filter: saturate(0.4); }

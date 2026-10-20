@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import type { ReactNode } from 'react';
 import type { WorkbenchConfig } from '../../lib/config';
 import { streamChat, type ToolStatus } from '../../lib/sse';
 import { displayToolName, type ChatContext } from '../../lib/types';
@@ -19,12 +20,13 @@ interface Props {
   hidden: boolean;
   onOpenSettings: () => void;
   onClose: () => void;
+  slot?: ReactNode;
 }
 
 let nextId = 1;
 const NO_MESSAGES: Msg[] = [];
 
-export function ChatPane({ cfg, context, contextLabel, hidden, onOpenSettings, onClose }: Props) {
+export function ChatPane({ cfg, context, contextLabel, hidden, onOpenSettings, onClose, slot }: Props) {
   const key = context ? `${context.kind}:${context.id}` : 'general';
   const [chats, setChats] = useState<Record<string, Msg[]>>({});
   const [draft, setDraft] = useState('');
@@ -155,6 +157,7 @@ export function ChatPane({ cfg, context, contextLabel, hidden, onOpenSettings, o
           </div>
         ))}
       </div>
+      {slot && <div className="chat-slot">{slot}</div>}
       <div className="chat-input">
         <textarea
           ref={inputRef}

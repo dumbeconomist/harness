@@ -38,7 +38,6 @@ struct CreateArgs {
     title: String,
     notes: Option<String>,
     status: Option<String>,
-    goal_id: Option<String>,
     #[allow(dead_code)]
     idempotency_key: Option<String>,
 }
@@ -49,7 +48,6 @@ struct UpdateArgs {
     title: Option<String>,
     notes: Option<String>,
     status: Option<String>,
-    goal_id: Option<String>,
     #[allow(dead_code)]
     idempotency_key: Option<String>,
 }
@@ -131,7 +129,7 @@ fn prepare(conn: &Connection, tool: &str, args: &Value) -> ApiResult<()> {
                 title: a.title,
                 notes: a.notes,
                 status: a.status,
-                goal_id: a.goal_id,
+                goal_id: None,
             };
             if patch.is_empty() {
                 return Err(ApiError::bad_request("no fields to update"));
@@ -215,7 +213,7 @@ fn exec(conn: &Connection, tool: &str, args: &Value) -> ApiResult<Executed> {
                     title: a.title,
                     notes: a.notes,
                     status: a.status,
-                    goal_id: a.goal_id,
+                    goal_id: None,
                 },
             )?;
             Ok(Executed {
@@ -232,7 +230,7 @@ fn exec(conn: &Connection, tool: &str, args: &Value) -> ApiResult<Executed> {
                 title: a.title,
                 notes: a.notes,
                 status: a.status,
-                goal_id: a.goal_id,
+                goal_id: None,
             };
             // Field-level "before": only the fields this call touches.
             let (has_title, has_notes, has_status, has_goal) = (
@@ -286,6 +284,8 @@ pub struct Journaled {
     /// True when an earlier execution with the same idempotency key was returned.
     pub replayed: bool,
 }
+
+pub const SHUTDOWN_NOTE: &str = "server shutting down";
 
 const KEY_REUSED: &str = "idempotency key reused with different arguments";
 
@@ -345,6 +345,7 @@ pub fn execute_journaled(
             .emit("task.changed", json!({"op": op, "id": id, "task": task}));
     }
     if !journaled.replayed {
+        tracing::info!(tool = %tool, actor = %actor, journal_id = %journaled.entry.id, "tool executed");
         state
             .events
             .emit("journal.appended", json!(journaled.entry));
@@ -523,10 +524,17 @@ pub async fn call(state: &SharedState, name: &str, args: Value) -> Result<ToolRe
                 return Ok(ToolResult::Error(format!("Denied by user: {note}")));
             }
             _ => {
+                let why = if decided.note.as_deref() == Some(SHUTDOWN_NOTE) {
+                    "Workbench is shutting down".to_string()
+                } else {
+                    format!(
+                        "no decision within {}s",
+                        state.config.approval_timeout.as_secs()
+                    )
+                };
                 return Ok(ToolResult::Error(format!(
-                    "Approval expired: no decision within {}s. Nothing was changed.",
-                    state.config.approval_timeout.as_secs()
-                )))
+                    "Approval expired: {why}. Nothing was changed."
+                )));
             }
         }
     }

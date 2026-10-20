@@ -34,3 +34,10 @@ export async function listTaskTitles(request: APIRequestContext): Promise<string
   const r = await request.get(`${CORE}/api/tasks`, { headers: UI_AUTH });
   return ((await r.json()) as { title: string }[]).map((t) => t.title);
 }
+
+/** Deny everything pending through the UI API so blocked MCP calls complete. */
+export async function denyAll(request: APIRequestContext): Promise<void> {
+  for (const a of await pendingApprovals(request)) {
+    await request.post(`${CORE}/api/approvals/${a.id}/decision`, { headers: UI_AUTH, data: { decision: 'deny', note: 'cleanup' } });
+  }
+}

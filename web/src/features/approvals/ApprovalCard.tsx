@@ -61,7 +61,21 @@ export function ApprovalDetail({ approval, tasks }: { approval: Approval; tasks:
   );
 }
 
+/** Returns [ready, rearm]. `ready` is false for `ms` after mount and after every rearm(). */
+export function useArm(ms: number): [boolean, () => void] {
+  const [epoch, setEpoch] = useState(0);
+  const [ready, setReady] = useState(ms <= 0);
+  useEffect(() => {
+    if (ms <= 0) return;
+    setReady(false);
+    const t = window.setTimeout(() => setReady(true), ms);
+    return () => window.clearTimeout(t);
+  }, [ms, epoch]);
+  return [ready, () => setEpoch((e) => e + 1)];
+}
+
 interface CardProps {
+  docked?: boolean;
   approval: Approval;
   pendingCount: number;
   tasks?: Task[];
@@ -76,18 +90,18 @@ interface CardProps {
  * and anything within guardMs of mount are ignored; Esc collapses (never denies); tier 2 needs an
  * explicit "Review" expand before it can be approved.
  */
-export function ApprovalCard({ approval, pendingCount, tasks = [], guardMs = 600, onDecide }: CardProps) {
+export function ApprovalCard({ docked = false, approval, pendingCount, tasks = [], guardMs = 600, onDecide }: CardProps) {
   const tier2 = approval.tier >= 2;
   const [note, setNote] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [collapsed, setCollapsed] = useState(false);
   const [reviewed, setReviewed] = useState(!tier2);
-  // Buttons render disabled until the guard elapses, so an early click is visibly inert, not silently dropped.
-  const [armed, setArmed] = useState(guardMs <= 0);
   const mountedAt = useRef(Date.now());
   const busyRef = useRef(false);
   const rootRef = useRef<HTMLElement>(null);
+  // Buttons render disabled until the guard elapses (and again after Review): visibly inert, not silently dropped.
+  const [ready, rearm] = useArm(guardMs);
 
   useEffect(() => {
     mountedAt.current = Date.now();
@@ -96,14 +110,19 @@ export function ApprovalCard({ approval, pendingCount, tasks = [], guardMs = 600
       window.setTimeout(() => rootRef.current?.focus(), 0);
     };
     window.addEventListener('workbench:focus-approval', focus);
-    const arm = window.setTimeout(() => setArmed(true), guardMs);
     return () => {
       window.removeEventListener('workbench:focus-approval', focus);
-      window.clearTimeout(arm);
     };
-  }, [guardMs]);
+  }, []);
 
   const guarded = () => Date.now() - mountedAt.current < guardMs;
+
+  const review = () => {
+    setReviewed(true);
+    mountedAt.current = Date.now(); // re-arm: Approve is inert for guardMs after Review
+    rearm();
+    window.setTimeout(() => rootRef.current?.focus(), 0); // never leave focus on a button that becomes Approve
+  };
 
   const decide = async (decision: 'approve' | 'deny') => {
     if (busyRef.current || guarded()) return;
@@ -137,7 +156,7 @@ export function ApprovalCard({ approval, pendingCount, tasks = [], guardMs = 600
 
   if (collapsed) {
     return (
-      <button className={`approval-badge tier-${tier2 ? 2 : 1}`} data-testid="approval-badge" onClick={() => setCollapsed(false)}>
+      <button className={`approval-badge tier-${tier2 ? 2 : 1}${docked ? ' docked' : ''}`} data-testid="approval-badge" onClick={() => setCollapsed(false)}>
         {pendingCount} approval{pendingCount === 1 ? '' : 's'} waiting — Review
       </button>
     );
@@ -148,7 +167,7 @@ export function ApprovalCard({ approval, pendingCount, tasks = [], guardMs = 600
       ref={rootRef}
       tabIndex={-1}
       onKeyDown={onKeyDown}
-      className={`approval-card tier-${tier2 ? 2 : 1}`}
+      className={`approval-card tier-${tier2 ? 2 : 1}${docked ? ' docked' : ''}`}
       role="group"
       aria-label="Approval needed"
       data-testid="approval-card"
@@ -187,15 +206,24 @@ export function ApprovalCard({ approval, pendingCount, tasks = [], guardMs = 600
         </p>
       )}
       <div className="ac-actions">
-        <button className="btn danger" onClick={() => void decide('deny')} disabled={busy || !armed} data-testid="deny-btn">
+        <button className="btn danger" onClick={() => void decide('deny')} disabled={busy || !ready} data-testid="deny-btn">
           Deny
         </button>
         {reviewed ? (
-          <button className="btn primary" onClick={() => void decide('approve')} disabled={busy || !armed} data-testid="approve-btn">
+          <button
+            key="approve"
+            className="btn primary"
+            onClick={(e) => {
+              if (tier2 && e.detail === 0) return; // keyboard activation can't approve tier 2
+              void decide('approve');
+            }}
+            disabled={busy || !ready}
+            data-testid="approve-btn"
+          >
             Approve <kbd>⌘↵</kbd>
           </button>
         ) : (
-          <button className="btn primary" onClick={() => setReviewed(true)} data-testid="review-btn">
+          <button key="review" className="btn primary" onClick={review} data-testid="review-btn">
             Review
           </button>
         )}
