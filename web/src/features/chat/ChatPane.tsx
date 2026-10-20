@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { WorkbenchConfig } from '../../lib/config';
-import { streamChat } from '../../lib/sse';
+import { streamChat, type ToolStatus } from '../../lib/sse';
 import { displayToolName, type ChatContext } from '../../lib/types';
 
 interface Msg {
@@ -9,7 +9,7 @@ interface Msg {
   content: string;
   error?: string;
   streaming?: boolean;
-  tools?: { name: string; status: 'running' | 'completed' }[];
+  tools?: { name: string; status: ToolStatus }[];
 }
 
 interface Props {
@@ -90,8 +90,8 @@ export function ChatPane({ cfg, context, contextLabel, hidden, onOpenSettings, o
           patchLast(k, (m) => {
             const tools = [...(m.tools ?? [])];
             const i = tools.findIndex((t) => t.name === tool && t.status === 'running');
-            if (i >= 0 && status === 'completed') tools[i] = { name: tool, status };
-            else if (i < 0 || status === 'running') tools.push({ name: tool, status });
+            if (i >= 0 && status !== 'running') tools[i] = { name: tool, status };
+            else tools.push({ name: tool, status });
             return { ...m, tools };
           }),
         onDone: () => patchLast(k, (m) => ({ ...m, streaming: false })),
@@ -129,7 +129,15 @@ export function ChatPane({ cfg, context, contextLabel, hidden, onOpenSettings, o
               <div className="chips">
                 {m.tools.map((t, i) => (
                   <span key={i} className={`chip ${t.status}`} data-testid="tool-chip">
-                    {t.status === 'running' ? <span className="spinner" aria-label="running" /> : <span aria-label="completed">✓</span>}{' '}
+                    {t.status === 'running' ? (
+                      <span className="spinner" aria-label="running" />
+                    ) : t.status === 'completed' ? (
+                      <span aria-label="completed">✓</span>
+                    ) : t.status === 'failed' ? (
+                      <span aria-label="failed">✕</span>
+                    ) : (
+                      <span aria-label="activity">•</span>
+                    )}{' '}
                     {displayToolName(t.name)}
                   </span>
                 ))}

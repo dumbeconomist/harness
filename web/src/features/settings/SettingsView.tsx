@@ -3,7 +3,9 @@ import { api as defaultApi, type Api } from '../../lib/api';
 import {
   KNOWN_TOOLS,
   PERMISSION_KEYS,
+  type ConnectionInfo,
   type Health,
+  type HermesSettings,
   type Permissions,
   type PermissionKey,
   type Policies,
@@ -31,6 +33,59 @@ export function SettingsView({ api = defaultApi, health, onRefreshHealth }: Prop
   const [perms, setPerms] = useState<Permissions | null>(null);
   const [policies, setPolicies] = useState<Policies>({});
   const [error, setError] = useState<string | null>(null);
+  const [hermes, setHermes] = useState<HermesSettings | null>(null);
+  const [urlDraft, setUrlDraft] = useState('');
+  const [keyDraft, setKeyDraft] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [conn, setConn] = useState<ConnectionInfo | null>(null);
+  const [reveal, setReveal] = useState(false);
+  const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    let live = true;
+    api
+      .getHermes()
+      .then((h) => {
+        if (!live) return;
+        setHermes(h);
+        setUrlDraft(h.url);
+      })
+      .catch(() => undefined);
+    return () => {
+      live = false;
+    };
+  }, [api]);
+
+  const saveHermes = async () => {
+    setSaving(true);
+    setSaved(false);
+    try {
+      const h = await api.putHermes({ url: urlDraft.trim() || undefined, ...(keyDraft ? { api_key: keyDraft } : {}) });
+      setHermes(h);
+      setUrlDraft(h.url);
+      setKeyDraft('');
+      setSaved(true);
+      setError(null);
+      onRefreshHealth?.();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const revealConn = async () => {
+    if (!conn) {
+      try {
+        setConn(await api.getConnection());
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+        return;
+      }
+    }
+    setReveal((r) => !r);
+  };
 
   useEffect(() => {
     let live = true;
@@ -99,13 +154,81 @@ export function SettingsView({ api = defaultApi, health, onRefreshHealth }: Prop
         </button>
       </div>
 
+      <h2 className="group-title">Hermes</h2>
+      <div className="card" data-testid="hermes-form">
+        <label className="field">
+          <span>Hermes API URL</span>
+          <input aria-label="Hermes URL" value={urlDraft} onChange={(e) => setUrlDraft(e.target.value)} placeholder="http://127.0.0.1:8643/v1" />
+        </label>
+        <label className="field">
+          <span>API key</span>
+          <input
+            aria-label="Hermes API key"
+            type="password"
+            autoComplete="off"
+            value={keyDraft}
+            onChange={(e) => setKeyDraft(e.target.value)}
+            placeholder={hermes?.has_key ? '•••••••• (saved — type to replace)' : 'Not set'}
+          />
+        </label>
+        <div className="row between">
+          <span className="muted" data-testid="hermes-meta">
+            {hermes
+              ? `${hermes.reachable ? 'Reachable' : 'Not reachable'} · key ${hermes.has_key ? 'set' : 'not set'}${hermes.model ? ` · model ${hermes.model}` : ''}`
+              : 'Loading…'}
+            {saved && ' · saved'}
+          </span>
+          <button className="btn primary" disabled={saving} onClick={() => void saveHermes()}>
+            {saving ? 'Saving…' : 'Save'}
+          </button>
+        </div>
+        {hermes?.has_key && !hermes.key_persisted && (
+          <p className="inline-warn" data-testid="key-not-persisted">
+            The API key is held in memory only and will be lost when Workbench quits (no Keychain available).
+          </p>
+        )}
+      </div>
+
+      <h2 className="group-title">Connect Hermes to Workbench</h2>
+      <div className="card conn" data-testid="connection-panel">
+        <ol>
+          <li>Reveal the connection snippet below.</li>
+          <li>Paste it into the config of your locked Workbench Hermes profile (its MCP servers section).</li>
+          <li>Restart that Hermes profile so it picks up the Workbench tools.</li>
+        </ol>
+        <div className="row gap">
+          <button className="btn small" onClick={() => void revealConn()}>
+            {reveal ? 'Hide' : 'Reveal'} snippet
+          </button>
+          {reveal && conn && (
+            <button
+              className="btn small"
+              onClick={() => {
+                void navigator.clipboard?.writeText(conn.hermes_config_snippet).then(() => setCopied(true));
+              }}
+            >
+              {copied ? 'Copied' : 'Copy'}
+            </button>
+          )}
+        </div>
+        {reveal && conn && (
+          <>
+            <p className="muted">
+              MCP URL: <code>{conn.mcp_url}</code>
+            </p>
+            <pre data-testid="mcp-snippet">{conn.hermes_config_snippet}</pre>
+            <p className="muted">This contains a secret token. Don’t share it.</p>
+          </>
+        )}
+      </div>
+
       <h2 className="group-title">Permissions</h2>
-      <p className="muted">Everything Hermes can reach beyond tasks is off until you turn it on.</p>
+      <p className="muted">These capabilities don’t exist yet, so they can’t be switched on. Everything beyond tasks stays off.</p>
       <ul className="cards">
         {PERMISSION_KEYS.map((k) => (
           <li key={k} className="card row between">
             <label htmlFor={`perm-${k}`}>
-              <strong>{PERMISSION_INFO[k].label}</strong>
+              <strong>{PERMISSION_INFO[k].label}</strong> <span className="badge unpriced">coming in G2–G6</span>
               <div className="muted">{PERMISSION_INFO[k].desc}</div>
             </label>
             <input
@@ -114,7 +237,7 @@ export function SettingsView({ api = defaultApi, health, onRefreshHealth }: Prop
               role="switch"
               className="switch"
               checked={perms?.[k] ?? false}
-              disabled={!perms}
+              disabled
               onChange={(e) => void togglePerm(k, e.target.checked)}
             />
           </li>

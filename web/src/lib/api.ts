@@ -1,7 +1,9 @@
 import { loadConfig, type WorkbenchConfig } from './config';
 import type {
   Approval,
+  ConnectionInfo,
   Health,
+  HermesSettings,
   JournalEntry,
   LedgerEntry,
   LedgerSummary,
@@ -90,6 +92,9 @@ export function createApi(cfg: WorkbenchConfig, fetchImpl: FetchLike = (i, init)
     getPermissions: () => request<Permissions>('GET', '/api/settings/permissions'),
     putPermissions: (p: Permissions) => request<Permissions>('PUT', '/api/settings/permissions', p),
     getPolicies: () => request<Policies>('GET', '/api/settings/policies'),
+    getHermes: () => request<HermesSettings>('GET', '/api/settings/hermes'),
+    putHermes: (b: { url?: string; api_key?: string }) => request<HermesSettings>('PUT', '/api/settings/hermes', b),
+    getConnection: () => request<ConnectionInfo>('GET', '/api/settings/connection'),
     putPolicies: (p: Policies) => request<Policies>('PUT', '/api/settings/policies', p),
   };
 }

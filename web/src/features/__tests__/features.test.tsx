@@ -4,6 +4,8 @@ import { describe, expect, it, vi } from 'vitest';
 import { ApprovalCard } from '../approvals/ApprovalCard';
 import { TasksView } from '../tasks/TasksView';
 import { JournalView, UndoButton } from '../journal/JournalView';
+import { LedgerView } from '../ledger/LedgerView';
+import { TaskDetail } from '../tasks/TaskDetail';
 import { SettingsView } from '../settings/SettingsView';
 import { CommandPalette, filterActions } from '../palette/CommandPalette';
 import type { Api } from '../../lib/api';
@@ -23,41 +25,6 @@ const approval = (over: Partial<Approval> = {}): Approval => ({
   ...over,
 });
 
-describe('ApprovalCard', () => {
-  it('shows tool, tier, summary and args', () => {
-    render(<ApprovalCard approval={approval({ tier: 2, tool: 'tasks_delete' })} pendingCount={3} onDecide={vi.fn()} />);
-    expect(screen.getByText('tasks_delete')).toBeInTheDocument();
-    expect(screen.getByTestId('tier-badge')).toHaveTextContent(/Tier 2.*Destructive/);
-    expect(screen.getByText(/Buy milk/, { selector: '.ac-summary' })).toBeInTheDocument();
-    expect(screen.getByText('+2 more waiting')).toBeInTheDocument();
-  });
-  it('⌘↵ approves and Esc denies', async () => {
-    const onDecide = vi.fn().mockResolvedValue(undefined);
-    const { unmount } = render(<ApprovalCard approval={approval()} pendingCount={1} onDecide={onDecide} />);
-    fireEvent.keyDown(window, { key: 'Enter', metaKey: true });
-    await waitFor(() => expect(onDecide).toHaveBeenCalledWith('approve', undefined));
-    unmount();
-    const onDecide2 = vi.fn().mockResolvedValue(undefined);
-    render(<ApprovalCard approval={approval()} pendingCount={1} onDecide={onDecide2} />);
-    fireEvent.keyDown(window, { key: 'Escape' });
-    await waitFor(() => expect(onDecide2).toHaveBeenCalledWith('deny', undefined));
-  });
-  it('plain Enter does not approve; note is passed along', async () => {
-    const onDecide = vi.fn().mockResolvedValue(undefined);
-    render(<ApprovalCard approval={approval()} pendingCount={1} onDecide={onDecide} />);
-    fireEvent.keyDown(window, { key: 'Enter' });
-    expect(onDecide).not.toHaveBeenCalled();
-    await userEvent.type(screen.getByLabelText('Note (optional)'), 'not now');
-    await userEvent.click(screen.getByTestId('deny-btn'));
-    expect(onDecide).toHaveBeenCalledWith('deny', 'not now');
-  });
-  it('shows an error if the decision fails', async () => {
-    render(<ApprovalCard approval={approval()} pendingCount={1} onDecide={vi.fn().mockRejectedValue(new Error('gone'))} />);
-    await userEvent.click(screen.getByTestId('approve-btn'));
-    expect(await screen.findByRole('alert')).toHaveTextContent('gone');
-  });
-});
-
 const task = (over: Partial<Task> = {}): Task => ({
   id: 't1',
   title: 'Write spec',
@@ -67,6 +34,88 @@ const task = (over: Partial<Task> = {}): Task => ({
   created_at: '',
   updated_at: '',
   ...over,
+});
+
+describe('ApprovalCard', () => {
+  const card = (over: Partial<Approval> = {}, props: Record<string, unknown> = {}) => {
+    const onDecide = vi.fn().mockResolvedValue(undefined);
+    const utils = render(<ApprovalCard approval={approval(over)} pendingCount={1} guardMs={0} onDecide={onDecide} {...props} />);
+    return { onDecide, ...utils };
+  };
+  it('shows tool, tier, summary and full args; never takes focus', () => {
+    card({ tier: 2, tool: 'tasks_delete' }, { pendingCount: 3 });
+    expect(screen.getByText('tasks_delete')).toBeInTheDocument();
+    expect(screen.getByTestId('tier-badge')).toHaveTextContent(/Tier 2.*Destructive/);
+    expect(screen.getByText('+2 more waiting', { exact: false })).toBeInTheDocument();
+    expect(document.body).toHaveFocus();
+  });
+  it('does not truncate long arguments', () => {
+    const long = 'x'.repeat(2000);
+    card({ args_json: JSON.stringify({ title: long }) });
+    expect(screen.getByTestId('ac-args').textContent).toContain(long);
+  });
+  it('shows old → new for updates using the task from the store', () => {
+    card(
+      { tool: 'tasks_update', args_json: JSON.stringify({ id: 't1', title: 'New name', status: 'todo' }) },
+      { tasks: [task({ title: 'Old name', status: 'todo' })] },
+    );
+    expect(screen.getByTestId('ac-changes')).toHaveTextContent('Old name');
+    expect(screen.getByTestId('ac-changes')).toHaveTextContent('New name');
+    expect(screen.getByTestId('ac-changes')).not.toHaveTextContent('status');
+  });
+  it('window-level keys never decide; Ctrl+Enter elsewhere does nothing', () => {
+    const { onDecide } = card();
+    fireEvent.keyDown(window, { key: 'Enter', metaKey: true });
+    fireEvent.keyDown(document.body, { key: 'Enter', ctrlKey: true });
+    fireEvent.keyDown(window, { key: 'Escape' });
+    expect(onDecide).not.toHaveBeenCalled();
+  });
+  it('⌘↵ with focus inside the card approves; repeat is ignored', async () => {
+    const { onDecide } = card();
+    const note = screen.getByLabelText('Note (optional)');
+    fireEvent.keyDown(note, { key: 'Enter', metaKey: true, repeat: true });
+    expect(onDecide).not.toHaveBeenCalled();
+    fireEvent.keyDown(note, { key: 'Enter', metaKey: true });
+    await waitFor(() => expect(onDecide).toHaveBeenCalledWith('approve', undefined));
+  });
+  it('Esc collapses to a badge and never denies', async () => {
+    const { onDecide } = card();
+    fireEvent.keyDown(screen.getByLabelText('Note (optional)'), { key: 'Escape' });
+    expect(onDecide).not.toHaveBeenCalled();
+    expect(screen.queryByTestId('approval-card')).toBeNull();
+    await userEvent.click(screen.getByTestId('approval-badge'));
+    expect(screen.getByTestId('approval-card')).toBeInTheDocument();
+  });
+  it('ignores everything within the mount guard window', async () => {
+    const { onDecide } = card({}, { guardMs: 600 });
+    fireEvent.keyDown(screen.getByLabelText('Note (optional)'), { key: 'Enter', metaKey: true });
+    await userEvent.click(screen.getByTestId('approve-btn'));
+    expect(onDecide).not.toHaveBeenCalled();
+    await new Promise((r) => setTimeout(r, 650));
+    await userEvent.click(screen.getByTestId('approve-btn'));
+    expect(onDecide).toHaveBeenCalledTimes(1);
+  });
+  it('tier 2 needs Review before Approve exists; ⌘↵ does nothing before review', async () => {
+    const { onDecide } = card({ tier: 2, tool: 'tasks_delete', args_json: '{"id":"t1"}' }, { tasks: [task()] });
+    expect(screen.queryByTestId('approve-btn')).toBeNull();
+    fireEvent.keyDown(screen.getByTestId('approval-card'), { key: 'Enter', metaKey: true });
+    expect(onDecide).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByTestId('review-btn'));
+    expect(screen.getByTestId('ac-target')).toHaveTextContent('Write spec');
+    await userEvent.click(screen.getByTestId('approve-btn'));
+    expect(onDecide).toHaveBeenCalledWith('approve', undefined);
+  });
+  it('passes the note on deny and shows failures', async () => {
+    const { onDecide } = card();
+    await userEvent.type(screen.getByLabelText('Note (optional)'), 'not now');
+    await userEvent.click(screen.getByTestId('deny-btn'));
+    expect(onDecide).toHaveBeenCalledWith('deny', 'not now');
+  });
+  it('shows an error if the decision fails', async () => {
+    render(<ApprovalCard approval={approval()} pendingCount={1} guardMs={0} onDecide={vi.fn().mockRejectedValue(new Error('gone'))} />);
+    await userEvent.click(screen.getByTestId('approve-btn'));
+    expect(await screen.findByRole('alert')).toHaveTextContent('gone');
+  });
 });
 
 describe('TasksView', () => {
@@ -137,7 +186,17 @@ describe('Undo button', () => {
     const onUndo = vi.fn().mockResolvedValue(undefined);
     render(<UndoButton entry={entry()} onUndo={onUndo} />);
     await userEvent.click(screen.getByRole('button', { name: 'Undo' }));
+    expect(onUndo).not.toHaveBeenCalled();
+    expect(screen.getByTestId('undo-confirm-box')).toHaveTextContent(/delete the task/);
+    await userEvent.click(screen.getByTestId('undo-confirm'));
     expect(onUndo).toHaveBeenCalledWith('j1');
+  });
+  it('explains a 409 stale conflict inline', async () => {
+    const err = Object.assign(new Error('Undo the newer edit first'), { code: 'stale' });
+    render(<UndoButton entry={entry()} onUndo={vi.fn().mockRejectedValue(err)} />);
+    await userEvent.click(screen.getByRole('button', { name: 'Undo' }));
+    await userEvent.click(screen.getByTestId('undo-confirm'));
+    expect(await screen.findByTestId('undo-error')).toHaveTextContent(/changed afterwards.*newer edit/);
   });
   it('is disabled once undone', () => {
     render(<UndoButton entry={entry({ undone_at: new Date().toISOString() })} onUndo={vi.fn()} />);
@@ -163,6 +222,9 @@ describe('SettingsView', () => {
       getPolicies: vi.fn().mockResolvedValue({}),
       putPermissions: vi.fn().mockImplementation(async (p) => p),
       putPolicies: vi.fn().mockImplementation(async (p) => p),
+      getHermes: vi.fn().mockResolvedValue({ url: 'http://h/v1', has_key: true, key_persisted: false, reachable: true }),
+      putHermes: vi.fn().mockImplementation(async (b) => ({ url: b.url, has_key: true, key_persisted: false, reachable: true })),
+      getConnection: vi.fn().mockResolvedValue({ mcp_url: 'http://127.0.0.1:8765/mcp', mcp_token: 'sekret', hermes_config_snippet: 'mcp_servers:\n  workbench: sekret' }),
     }) as unknown as Api;
 
   it('locks tier-2 tools to always ask, allows tier-1 auto', async () => {
@@ -177,15 +239,30 @@ describe('SettingsView', () => {
     await userEvent.selectOptions(t1, 'auto');
     expect(api.putPolicies).toHaveBeenCalledWith({ tasks_create: 'auto' });
   });
-  it('permissions default off and toggle persists full object', async () => {
+  it('permission switches are off and disabled with a coming-soon label', async () => {
+    render(<SettingsView api={mkApi()} health={null} />);
+    const web = await screen.findByRole('switch', { name: /Web access/ });
+    expect(web).not.toBeChecked();
+    expect(web).toBeDisabled();
+    expect(screen.getAllByText('coming in G2–G6').length).toBe(6);
+    expect(screen.getByTestId('hermes-status')).toHaveTextContent('core unreachable');
+  });
+  it('saves Hermes url/key, warns when key not persisted', async () => {
     const api = mkApi();
     render(<SettingsView api={api} health={null} />);
-    const web = await screen.findByRole('switch', { name: /Web access/ });
-    await waitFor(() => expect(web).toBeEnabled());
-    expect(web).not.toBeChecked();
-    await userEvent.click(web);
-    expect(api.putPermissions).toHaveBeenCalledWith(expect.objectContaining({ web: true, terminal: false }));
-    expect(screen.getByTestId('hermes-status')).toHaveTextContent('core unreachable');
+    expect(await screen.findByTestId('key-not-persisted')).toBeInTheDocument();
+    const url = screen.getByLabelText('Hermes URL');
+    await userEvent.clear(url);
+    await userEvent.type(url, 'http://z/v1');
+    await userEvent.type(screen.getByLabelText('Hermes API key'), 'k1');
+    await userEvent.click(screen.getByRole('button', { name: 'Save' }));
+    expect(api.putHermes).toHaveBeenCalledWith({ url: 'http://z/v1', api_key: 'k1' });
+  });
+  it('connection snippet is hidden until revealed', async () => {
+    render(<SettingsView api={mkApi()} health={null} />);
+    expect(screen.queryByTestId('mcp-snippet')).toBeNull();
+    await userEvent.click(screen.getByRole('button', { name: /Reveal snippet/ }));
+    expect(await screen.findByTestId('mcp-snippet')).toHaveTextContent('sekret');
   });
   it('shows Hermes reachability', async () => {
     render(<SettingsView api={mkApi()} health={{ ok: true, version: '0.1', hermes: { reachable: false } }} />);
@@ -199,6 +276,42 @@ function within2(el: HTMLElement) {
     queryByText: (t: string) => Array.from(el.querySelectorAll('option')).find((o) => o.textContent === t) ?? null,
   };
 }
+
+describe('LedgerView', () => {
+  it('shows tokens and unpriced badges', () => {
+    render(
+      <LedgerView
+        summary={{
+          total_usd: 0,
+          total_tokens: 1234,
+          unpriced_runs: 2,
+          by_model: [{ model: 'hermes-agent', usd: 0, tokens: 1234, priced: false }],
+          by_day: [],
+        }}
+      />,
+    );
+    expect(screen.getByTestId('ledger-tokens')).toHaveTextContent('1,234 tokens');
+    expect(screen.getByTestId('unpriced-badge')).toBeInTheDocument();
+    expect(screen.getByTestId('ledger-unpriced-note')).toHaveTextContent('2 runs');
+  });
+});
+
+describe('TaskDetail', () => {
+  it('edits notes on blur, shows agent notes, confirms delete', async () => {
+    const onUpdate = vi.fn().mockResolvedValue(undefined);
+    const onDelete = vi.fn();
+    render(<TaskDetail task={task({ notes: 'from agent' })} onUpdate={onUpdate} onDelete={onDelete} />);
+    const notes = screen.getByLabelText('Task notes');
+    expect(notes).toHaveValue('from agent');
+    await userEvent.type(notes, '!');
+    await userEvent.tab();
+    expect(onUpdate).toHaveBeenCalledWith('t1', { notes: 'from agent!' });
+    await userEvent.click(screen.getByTestId('td-delete'));
+    expect(onDelete).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByTestId('td-delete-confirm'));
+    expect(onDelete).toHaveBeenCalledWith('t1');
+  });
+});
 
 describe('CommandPalette', () => {
   const actions = [

@@ -1,7 +1,7 @@
 import { expect, test } from '@playwright/test';
 import fs from 'node:fs';
 import path from 'node:path';
-import { callTool, toolText } from './helpers';
+import { callTool, createTask, listTaskTitles, pendingApprovals, toolText } from './helpers';
 
 const SHOTS = path.resolve(__dirname, '../screenshots');
 fs.mkdirSync(SHOTS, { recursive: true });
@@ -44,11 +44,17 @@ test('approval flow: MCP tasks_create blocks, card appears, Approve creates the 
   await page.screenshot({ path: shot('03-task-created') });
 });
 
-test('keyboard: ⌘↵ approves the card', async ({ page, request }) => {
+test('keyboard: ⌘↵ approves only when focus is inside the card', async ({ page, request }) => {
   await page.goto('/');
   const title = `Keyboard ${Date.now()}`;
   const pending = callTool(request, 'tasks_create', { title });
-  await expect(page.getByTestId('approval-card')).toBeVisible();
+  const card = page.getByTestId('approval-card');
+  await expect(card).toBeVisible();
+  await page.waitForTimeout(800); // past the mount guard
+  await page.keyboard.press('Meta+Enter'); // focus is NOT in the card
+  await page.waitForTimeout(300);
+  expect((await pendingApprovals(request)).length).toBeGreaterThan(0);
+  await card.getByLabel('Note (optional)').click();
   await page.keyboard.press('Meta+Enter');
   await expect(page.getByTestId('task-row').filter({ hasText: title })).toBeVisible();
   expect(toolText(await (await pending).json())).toContain(title);
@@ -86,6 +92,7 @@ test('undo flow: quick-add a task, undo it from Activity', async ({ page }) => {
   await expect(entry).toBeVisible();
   await page.screenshot({ path: shot('05-activity') });
   await entry.getByTestId('undo-btn').click();
+  await entry.getByTestId('undo-confirm').click();
   await expect(entry.getByRole('button', { name: 'Undone' })).toBeDisabled();
 
   await page.getByRole('button', { name: /Tasks/ }).click();
@@ -124,4 +131,156 @@ test('ledger shows spend after chat; settings tier-2 locked; palette opens', asy
   await page.getByRole('textbox', { name: 'Command', exact: true }).fill('ledger');
   await page.keyboard.press('Enter');
   await expect(page.getByRole('heading', { name: 'Ledger' })).toBeVisible();
+});
+
+test.describe('approval card safety regressions (P0)', () => {
+  /** A tier-2 delete request for a task we create; returns the in-flight MCP promise. */
+  async function armDelete(request: Parameters<typeof callTool>[0]) {
+    const title = `Precious ${Date.now()}`;
+    const task = await createTask(request, title);
+    return { title, task, pending: callTool(request, 'tasks_delete', { id: task.id }) };
+  }
+  async function assertStillPending(request: Parameters<typeof callTool>[0], title: string) {
+    await new Promise((r) => setTimeout(r, 500));
+    expect((await pendingApprovals(request)).some((a) => a.tool === 'tasks_delete')).toBe(true);
+    expect(await listTaskTitles(request)).toContain(title);
+  }
+  async function cleanup(page: import('@playwright/test').Page, pending: ReturnType<typeof callTool>) {
+    // deny through the UI so the blocked MCP call completes
+    await page.getByTestId('deny-btn').click();
+    await pending;
+  }
+
+  test('(a) typing continuously in the chat composer while a tier-2 card appears does not decide it', async ({ page, request }) => {
+    await page.goto('/');
+    const composer = page.getByLabel('Message Hermes');
+    await composer.click();
+    const text = 'what should I do next with all of these tasks and things';
+    const typing = composer.pressSequentially(text, { delay: 40 });
+    await page.waitForTimeout(400);
+    const { title, pending } = await armDelete(request);
+    await typing;
+    await expect(page.getByTestId('approval-card')).toBeVisible();
+    await expect(composer).toHaveValue(text);
+    await assertStillPending(request, title);
+    await page.screenshot({ path: shot('09-tier2-card') });
+    await cleanup(page, pending);
+  });
+
+  test('(b) Ctrl+Enter and ⌘+Enter in the composer do not approve', async ({ page, request }) => {
+    await page.goto('/');
+    const { title, pending } = await armDelete(request);
+    await expect(page.getByTestId('approval-card')).toBeVisible();
+    await page.waitForTimeout(800);
+    const composer = page.getByLabel('Message Hermes');
+    await composer.click();
+    await composer.pressSequentially('hello');
+    await page.keyboard.press('Control+Enter');
+    await page.keyboard.press('Meta+Enter');
+    await assertStillPending(request, title);
+    await expect(composer).toHaveValue('hello');
+    await cleanup(page, pending);
+  });
+
+  test('(c) Esc in quick-add does not deny (and Esc in the card only collapses it)', async ({ page, request }) => {
+    await page.goto('/');
+    const { title, pending } = await armDelete(request);
+    await expect(page.getByTestId('approval-card')).toBeVisible();
+    await page.waitForTimeout(800);
+    await page.getByLabel('New task').click();
+    await page.keyboard.press('Escape');
+    await assertStillPending(request, title);
+    await expect(page.getByTestId('approval-card')).toBeVisible();
+    await page.getByTestId('approval-card').click({ position: { x: 20, y: 20 } });
+    await page.keyboard.press('Escape');
+    await expect(page.getByTestId('approval-badge')).toBeVisible();
+    await page.screenshot({ path: shot('10-card-collapsed') });
+    await assertStillPending(request, title);
+    await page.getByTestId('approval-badge').click();
+    await cleanup(page, pending);
+  });
+
+  test('(d) holding Enter does not approve', async ({ page, request }) => {
+    await page.goto('/');
+    const { title, pending } = await armDelete(request);
+    await expect(page.getByTestId('approval-card')).toBeVisible();
+    await page.getByLabel('Message Hermes').click();
+    for (let i = 0; i < 15; i++) {
+      await page.keyboard.down('Enter');
+      await page.waitForTimeout(40);
+    }
+    await page.keyboard.up('Enter');
+    await assertStillPending(request, title);
+    await cleanup(page, pending);
+  });
+
+  test('tier 2 requires Review, then an explicit click deletes the task', async ({ page, request }) => {
+    await page.goto('/');
+    const { title, pending } = await armDelete(request);
+    const card = page.getByTestId('approval-card');
+    await expect(card).toBeVisible();
+    await expect(card.getByTestId('approve-btn')).toHaveCount(0);
+    await expect(card.getByTestId('tier-badge')).toContainText('Tier 2');
+    await page.waitForTimeout(800);
+    await card.getByTestId('review-btn').click();
+    await expect(card.getByTestId('ac-target')).toContainText(title);
+    await page.screenshot({ path: shot('11-tier2-reviewed') });
+    await card.getByTestId('approve-btn').click();
+    const body = await (await pending).json();
+    expect(body.result?.isError).toBeFalsy();
+    await expect.poll(() => listTaskTitles(request)).not.toContain(title);
+  });
+});
+
+test('real loop: chat "add a task to buy milk" → tool chip → card → approve → reply → task → undo', async ({ page, request }) => {
+  await page.goto('/');
+  const milk = `buy milk ${Date.now()}`;
+  const composer = page.getByLabel('Message Hermes');
+  await composer.fill(`add a task to ${milk}`);
+  await composer.press('Enter');
+
+  await expect(page.getByTestId('tool-chip').first()).toContainText('tasks_create');
+  const card = page.getByTestId('approval-card');
+  await expect(card).toBeVisible();
+  await expect(card).toContainText(milk);
+  await page.waitForTimeout(800);
+  await page.screenshot({ path: shot('12-loop-card') });
+  await card.getByTestId('approve-btn').click();
+
+  await expect(page.getByTestId('msg-assistant').last()).toContainText(`Added task: ${milk}`);
+  await expect(page.getByTestId('task-row').filter({ hasText: milk })).toBeVisible();
+  await page.screenshot({ path: shot('13-loop-done') });
+
+  await page.getByRole('button', { name: /Activity/ }).click();
+  const entry = page.getByTestId('journal-entry').filter({ hasText: milk }).first();
+  await entry.getByTestId('undo-btn').click();
+  await entry.getByTestId('undo-confirm').click();
+  await expect(entry.getByRole('button', { name: 'Undone' })).toBeDisabled();
+  await page.getByRole('button', { name: /Tasks/ }).click();
+  await expect(page.getByTestId('task-row').filter({ hasText: milk })).toHaveCount(0);
+});
+
+test('task detail: agent-visible notes can be edited; delete needs confirm', async ({ page, request }) => {
+  const t = await createTask(request, `Detail ${Date.now()}`);
+  await page.goto('/');
+  await page.getByTestId('task-row').filter({ hasText: t.title }).click();
+  const detail = page.getByTestId('task-detail');
+  await detail.getByLabel('Task notes').fill('remember the oat milk');
+  await detail.getByLabel('Task title').click(); // blur notes → save
+  await expect.poll(async () => (await (await request.get(`http://127.0.0.1:${process.env.E2E_CORE_PORT ?? '8765'}/api/tasks`, { headers: { Authorization: 'Bearer e2e-token' } })).json()).find((x: { id: string }) => x.id === t.id)?.notes).toBe('remember the oat milk');
+  await page.screenshot({ path: shot('14-task-detail') });
+  await detail.getByTestId('td-delete').click();
+  await detail.getByTestId('td-delete-confirm').click();
+  await expect(page.getByTestId('task-row').filter({ hasText: t.title })).toHaveCount(0);
+});
+
+test('settings: Hermes form, connection reveal, disabled permissions', async ({ page }) => {
+  await page.goto('/');
+  await page.getByRole('button', { name: /Settings/ }).click();
+  await expect(page.getByLabel('Hermes URL')).toBeVisible();
+  await expect(page.getByTestId('mcp-snippet')).toHaveCount(0);
+  await page.getByRole('button', { name: /Reveal snippet/ }).click();
+  await expect(page.getByTestId('mcp-snippet')).toContainText('e2e-mcp-token');
+  await expect(page.getByRole('switch', { name: /Web access/ })).toBeDisabled();
+  await page.screenshot({ path: shot('15-settings-hermes') });
 });

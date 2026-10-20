@@ -469,7 +469,7 @@ async fn pending_approvals_expire_on_restart() {
         let base = base.clone();
         tokio::spawn(async move {
             c.post(format!("{base}/mcp"))
-                .bearer_auth("test-token")
+                .bearer_auth("test-mcp-token")
                 .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"tasks_create","arguments":{"title":"x"}}}))
                 .send()
                 .await
@@ -993,6 +993,9 @@ async fn chat_streams_deltas_and_records_ledger_with_cost() {
     assert!((s["total_usd"].as_f64().unwrap() - 0.033).abs() < 1e-9);
     assert_eq!(s["by_model"][0]["model"], "claude-sonnet-4-5");
     assert_eq!(s["by_model"][0]["tokens"], 3000);
+    assert_eq!(s["by_model"][0]["priced"], true);
+    assert_eq!(s["total_tokens"], 3000);
+    assert_eq!(s["unpriced_runs"], 0);
     assert_eq!(s["by_day"].as_array().unwrap().len(), 1);
     assert_eq!(s["by_day"][0]["day"].as_str().unwrap().len(), 10);
     h.shutdown().await;
@@ -1016,6 +1019,9 @@ async fn chat_with_hermes_model_is_unpriced() {
     assert_eq!(e["source"], "unpriced");
     assert_eq!(e["cost_usd"], 0.0);
     assert_eq!(e["completion_tokens"], 2000);
+    let sum = h.get("/api/ledger/summary").await;
+    assert_eq!(sum["unpriced_runs"], 1);
+    assert_eq!(sum["by_model"][0]["priced"], false);
     h.shutdown().await;
 }
 
@@ -1276,5 +1282,585 @@ async fn chat_forwards_tool_progress_and_session_id() {
     assert!(evs.iter().all(|(e, _)| e != "error" && e != "hermes.other"));
     let cap = fake.captured.lock().unwrap().requests.clone();
     assert_eq!(cap[0].2.as_deref(), Some("sess-42"));
+    h.shutdown().await;
+}
+
+// ------------------------------------------------- round 2: undo / idempotency
+
+async fn set_auto(h: &Harness) {
+    let (s, _) = h
+        .put(
+            "/api/settings/policies",
+            json!({"tasks_create": "auto", "tasks_update": "auto"}),
+        )
+        .await;
+    assert_eq!(s, 200);
+}
+
+async fn journal_ids(h: &Harness, tool: &str, actor: &str) -> Vec<String> {
+    h.get("/api/journal?limit=100")
+        .await
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["tool"] == tool && e["actor"] == actor)
+        .map(|e| e["id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn undo_does_not_clobber_later_user_edit() {
+    let h = Harness::start().await;
+    set_auto(&h).await;
+    let (_, t) = h
+        .post("/api/tasks", json!({"title": "draft", "notes": "n"}))
+        .await;
+    let id = t["id"].as_str().unwrap();
+    let r = h
+        .call_tool("tasks_update", json!({"id": id, "status": "done"}))
+        .await;
+    assert!(r.get("isError").is_none(), "{r}");
+    let agent_entry = journal_ids(&h, "tasks_update", "agent").await.remove(0);
+    // the user edits title + notes afterwards
+    let (s, _) = h
+        .send_json(
+            Method::PATCH,
+            &format!("/api/tasks/{id}"),
+            json!({"title": "my careful title", "notes": "my notes"}),
+        )
+        .await;
+    assert_eq!(s, 200);
+    let user_entry = journal_ids(&h, "tasks_update", "user").await.remove(0);
+
+    let (s, v) = h
+        .post(&format!("/api/journal/{agent_entry}/undo"), json!({}))
+        .await;
+    assert_eq!(s, 409);
+    assert_eq!(v["error"]["code"], "stale");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(&user_entry),
+        "{v}"
+    );
+    let task = &h.tasks().await[0];
+    assert_eq!(task["title"], "my careful title");
+    assert_eq!(task["notes"], "my notes");
+    assert_eq!(task["status"], "done");
+
+    // undo newest first, then the agent entry works
+    let (s, _) = h
+        .post(&format!("/api/journal/{user_entry}/undo"), json!({}))
+        .await;
+    assert_eq!(s, 200);
+    let (s, _) = h
+        .post(&format!("/api/journal/{agent_entry}/undo"), json!({}))
+        .await;
+    assert_eq!(s, 200);
+    let task = &h.tasks().await[0];
+    assert_eq!(task["title"], "draft");
+    assert_eq!(task["status"], "todo");
+    assert_eq!(task["updated_at"], t["updated_at"]);
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn undo_create_is_stale_after_edit() {
+    let h = Harness::start().await;
+    set_auto(&h).await;
+    let r = h
+        .call_tool("tasks_create", json!({"title": "keep me"}))
+        .await;
+    let id = r["structuredContent"]["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let create_entry = journal_ids(&h, "tasks_create", "agent").await.remove(0);
+    h.send_json(
+        Method::PATCH,
+        &format!("/api/tasks/{id}"),
+        json!({"notes": "important"}),
+    )
+    .await;
+    let (s, v) = h
+        .post(&format!("/api/journal/{create_entry}/undo"), json!({}))
+        .await;
+    assert_eq!((s, v["error"]["code"].as_str()), (409, Some("stale")));
+    let tasks = h.tasks().await;
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0]["notes"], "important");
+    // unedited create can still be undone
+    let r = h
+        .call_tool("tasks_create", json!({"title": "scratch"}))
+        .await;
+    assert!(r.get("isError").is_none());
+    let e = journal_ids(&h, "tasks_create", "agent").await.remove(0);
+    let (s, _) = h.post(&format!("/api/journal/{e}/undo"), json!({})).await;
+    assert_eq!(s, 200);
+    assert_eq!(h.tasks().await.len(), 1);
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn update_flip_flop_is_not_a_false_replay() {
+    let h = Harness::start().await;
+    set_auto(&h).await;
+    let (_, t) = h.post("/api/tasks", json!({"title": "flip"})).await;
+    let id = t["id"].as_str().unwrap();
+    for st in ["doing", "todo", "doing"] {
+        let r = h
+            .call_tool("tasks_update", json!({"id": id, "status": st}))
+            .await;
+        assert!(r.get("isError").is_none(), "{r}");
+        assert_eq!(r["structuredContent"]["task"]["status"], st);
+        assert_eq!(h.tasks().await[0]["status"], st);
+    }
+    assert_eq!(journal_ids(&h, "tasks_update", "agent").await.len(), 3);
+    // an immediate identical retry of the last call is a genuine replay
+    let r = h
+        .call_tool("tasks_update", json!({"id": id, "status": "doing"}))
+        .await;
+    assert!(r.get("isError").is_none());
+    assert_eq!(journal_ids(&h, "tasks_update", "agent").await.len(), 3);
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn create_after_user_delete_really_creates() {
+    let h = Harness::start().await;
+    set_auto(&h).await;
+    let r1 = h.call_tool("tasks_create", json!({"title": "milk"})).await;
+    let id1 = r1["structuredContent"]["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let r = h
+        .req(Method::DELETE, &format!("/api/tasks/{id1}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 204);
+    let r2 = h.call_tool("tasks_create", json!({"title": "milk"})).await;
+    let id2 = r2["structuredContent"]["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(id1, id2);
+    let tasks = h.tasks().await;
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0]["id"], id2);
+    // edited-since also defeats the dedupe
+    h.send_json(
+        Method::PATCH,
+        &format!("/api/tasks/{id2}"),
+        json!({"notes": "x"}),
+    )
+    .await;
+    let r3 = h.call_tool("tasks_create", json!({"title": "milk"})).await;
+    assert_ne!(r3["structuredContent"]["task"]["id"], json!(id2));
+    assert_eq!(h.tasks().await.len(), 2);
+    // but an untouched duplicate still dedupes
+    let r4 = h.call_tool("tasks_create", json!({"title": "milk"})).await;
+    assert_eq!(r4["structuredContent"], r3["structuredContent"]);
+    assert_eq!(h.tasks().await.len(), 2);
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn explicit_key_reuse_with_different_args_or_tool_errors() {
+    let h = Harness::start().await;
+    set_auto(&h).await;
+    let r = h
+        .call_tool(
+            "tasks_create",
+            json!({"title": "one", "idempotency_key": "K"}),
+        )
+        .await;
+    assert!(r.get("isError").is_none());
+    let id = r["structuredContent"]["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // same key, different args
+    let r = h
+        .call_tool(
+            "tasks_create",
+            json!({"title": "two", "idempotency_key": "K"}),
+        )
+        .await;
+    assert_eq!(r["isError"], true);
+    assert!(
+        text_of(&r).contains("reused with different arguments"),
+        "{r}"
+    );
+    // same key, different tool
+    let r = h
+        .call_tool(
+            "tasks_update",
+            json!({"id": id, "title": "x", "idempotency_key": "K"}),
+        )
+        .await;
+    assert_eq!(r["isError"], true);
+    assert!(text_of(&r).contains("reused with different arguments"));
+    let tasks = h.tasks().await;
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0]["title"], "one");
+    // same key + same args still replays
+    let r = h
+        .call_tool(
+            "tasks_create",
+            json!({"idempotency_key": "K", "title": "one"}),
+        )
+        .await;
+    assert!(r.get("isError").is_none());
+    assert_eq!(h.tasks().await.len(), 1);
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn unknown_tool_fields_are_rejected() {
+    let h = Harness::start().await;
+    set_auto(&h).await;
+    let r = h
+        .call_tool("tasks_create", json!({"title": "x", "priority": "high"}))
+        .await;
+    assert_eq!(r["isError"], true);
+    assert!(h.tasks().await.is_empty());
+    // the REST API tolerates a whole Task echoed back
+    let (s, t) = h
+        .post(
+            "/api/tasks",
+            json!({"title": "ok", "id": "client-id", "created_at": "x"}),
+        )
+        .await;
+    assert_eq!(s, 200);
+    assert_ne!(t["id"], "client-id");
+    let (s, body) = h
+        .send_json(
+            Method::PATCH,
+            &format!("/api/tasks/{}", t["id"].as_str().unwrap()),
+            t.clone(),
+        )
+        .await;
+    assert_eq!(s, 200, "{body}");
+    h.shutdown().await;
+}
+
+// ------------------------------------------------------- round 2: credentials
+
+#[tokio::test]
+async fn mcp_token_cannot_use_api_and_ui_token_cannot_use_mcp() {
+    let h = Harness::start().await;
+    let (_, t) = h.post("/api/tasks", json!({"title": "victim"})).await;
+    let id = t["id"].as_str().unwrap();
+    let mcp = |m: Method, p: String| h.client.request(m, h.url(&p)).bearer_auth(&h.mcp_token);
+    let r = mcp(Method::DELETE, format!("/api/tasks/{id}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 401);
+    let r = mcp(Method::PUT, "/api/settings/policies".into())
+        .json(&json!({"tasks_create": "auto"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 401);
+    let r = mcp(Method::POST, "/api/approvals/anything/decision".into())
+        .json(&json!({"decision": "approve"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 401);
+    let r = mcp(Method::GET, "/api/events?token=".to_string() + &h.mcp_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 401);
+    assert_eq!(h.tasks().await.len(), 1);
+    assert_eq!(h.get("/api/settings/policies").await["tasks_create"], "ask");
+
+    let r = h
+        .client
+        .post(h.url("/mcp"))
+        .bearer_auth(&h.token)
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"ping"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 401);
+    assert_ne!(h.token, h.mcp_token);
+    // the MCP token does work on /mcp
+    assert_eq!(
+        h.mcp(json!({"jsonrpc":"2.0","id":1,"method":"ping"})).await["result"],
+        json!({})
+    );
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn tokens_are_persisted_and_reused_and_env_overrides() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = common::config(dir.path(), 5, "http://127.0.0.1:1/v1");
+    cfg.token = None;
+    cfg.mcp_token = None;
+    let s1 = workbench_core::serve(cfg.clone()).await.unwrap();
+    let (t1, m1) = (s1.token.clone(), s1.mcp_token.clone());
+    assert_ne!(t1, m1);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("token")).unwrap(),
+        t1
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("mcp_token")).unwrap(),
+        m1
+    );
+    s1.shutdown().await;
+    let s2 = workbench_core::serve(cfg.clone()).await.unwrap();
+    assert_eq!(
+        (s2.token.clone(), s2.mcp_token.clone()),
+        (t1.clone(), m1.clone())
+    );
+    s2.shutdown().await;
+    cfg.token = Some("env-ui".into());
+    let s3 = workbench_core::serve(cfg).await.unwrap();
+    assert_eq!(s3.token, "env-ui");
+    assert_eq!(s3.mcp_token, m1);
+    // env value is not written over the file
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("token")).unwrap(),
+        t1
+    );
+    s3.shutdown().await;
+}
+
+#[tokio::test]
+async fn api_refuses_foreign_origin_even_with_token() {
+    let h = Harness::start().await;
+    let r = h
+        .req(Method::GET, "/api/tasks")
+        .header("origin", "http://evil.example")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403);
+    let r = h
+        .req(Method::GET, "/api/tasks")
+        .header("origin", "http://localhost:5173")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    h.shutdown().await;
+}
+
+// ------------------------------------------------------ round 2: wiring
+
+#[tokio::test]
+async fn health_reports_addr_and_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = common::config(dir.path(), 5, "http://127.0.0.1:1/v1");
+    cfg.addr_fallback = true;
+    let s = workbench_core::serve(cfg).await.unwrap();
+    let v: Value = reqwest::get(format!("http://{}/api/health", s.addr))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["addr"], s.addr.to_string());
+    assert_eq!(v["addr_fallback"], true);
+    s.shutdown().await;
+    let h = Harness::start().await;
+    let v: Value = h
+        .client
+        .get(h.url("/api/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["addr_fallback"], false);
+    h.shutdown().await;
+}
+
+#[test]
+fn default_config_matches_contract() {
+    let c = workbench_core::Config::from_lookup(|_| None).unwrap();
+    assert_eq!(c.addr.to_string(), "127.0.0.1:8765");
+    assert_eq!(c.hermes_url, "http://127.0.0.1:8643/v1");
+}
+
+#[tokio::test]
+async fn connection_endpoint_gives_mcp_url_token_and_snippet() {
+    let h = Harness::start().await;
+    let v = h.get("/api/settings/connection").await;
+    assert_eq!(v["mcp_url"], format!("{}/mcp", h.base));
+    assert_eq!(v["mcp_token"], h.mcp_token);
+    let snip = v["hermes_config_snippet"].as_str().unwrap();
+    for needle in [
+        "mcp_servers:",
+        "  workbench:",
+        &format!("url: \"{}/mcp\"", h.base),
+        &format!("Authorization: \"Bearer {}\"", h.mcp_token),
+        "timeout: 600",
+        "connect_timeout: 30",
+    ] {
+        assert!(snip.contains(needle), "missing {needle} in\n{snip}");
+    }
+    assert!(
+        !snip.contains(&h.token),
+        "UI token must never be in the snippet"
+    );
+    // requires the UI token
+    let r = h
+        .client
+        .get(h.url("/api/settings/connection"))
+        .bearer_auth(&h.mcp_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 401);
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn hermes_settings_hot_swap_and_never_leak_key() {
+    let fake = fake_hermes("hermes-agent", None).await;
+    let dir = tempfile::tempdir().unwrap();
+    let store = std::sync::Arc::new(workbench_core::secrets::MemorySecretStore::default());
+    let mut cfg = common::config(dir.path(), 5, "http://127.0.0.1:1/v1");
+    cfg.hermes_api_key = None;
+    cfg.secret_store = Some(store.clone());
+    let s = workbench_core::serve(cfg.clone()).await.unwrap();
+    let base = format!("http://{}", s.addr);
+    let c = reqwest::Client::new();
+    let ui = |m: Method, p: &str| c.request(m, format!("{base}{p}")).bearer_auth(&s.token);
+
+    let v: Value = ui(Method::GET, "/api/settings/hermes")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["url"], "http://127.0.0.1:1/v1");
+    assert_eq!(
+        (
+            v["has_key"].clone(),
+            v["key_persisted"].clone(),
+            v["reachable"].clone()
+        ),
+        (json!(false), json!(false), json!(false))
+    );
+    assert_eq!(v["model"], "hermes-agent");
+
+    // bad url
+    let r = ui(Method::PUT, "/api/settings/hermes")
+        .json(&json!({"url": "ftp://x"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+
+    // hot-swap url + key, no restart
+    let r = ui(Method::PUT, "/api/settings/hermes")
+        .json(&json!({"url": fake.url, "api_key": "sk-secret-123"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let text = r.text().await.unwrap();
+    assert!(!text.contains("sk-secret-123"));
+    let v: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(v["url"], fake.url);
+    assert_eq!(
+        (
+            v["has_key"].clone(),
+            v["key_persisted"].clone(),
+            v["reachable"].clone()
+        ),
+        (json!(true), json!(true), json!(true))
+    );
+    assert_eq!(
+        workbench_core::secrets::SecretStore::get(&*store, "hermes_api_key").as_deref(),
+        Some("sk-secret-123")
+    );
+    let text = ui(Method::GET, "/api/settings/hermes")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(!text.contains("sk-secret-123"));
+
+    // chat now goes to the new Hermes with the new key
+    let body = ui(Method::POST, "/api/chat")
+        .json(&json!({"messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(parse_sse(&body).iter().any(|(e, _)| e == "done"), "{body}");
+    assert_eq!(
+        fake.captured.lock().unwrap().requests[0].0.as_deref(),
+        Some("Bearer sk-secret-123")
+    );
+    let h: Value = c
+        .get(format!("{base}/api/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(h["hermes"]["reachable"], true);
+    // requires the UI token
+    let r = c
+        .get(format!("{base}/api/settings/hermes"))
+        .bearer_auth(&s.mcp_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 401);
+    s.shutdown().await;
+
+    // url persisted in settings, key restored from the secret store after restart
+    let s2 = workbench_core::serve(cfg).await.unwrap();
+    let v: Value = c
+        .get(format!("http://{}/api/settings/hermes", s2.addr))
+        .bearer_auth(&s2.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["url"], fake.url);
+    assert_eq!(
+        (v["has_key"].clone(), v["key_persisted"].clone()),
+        (json!(true), json!(true))
+    );
+    s2.shutdown().await;
+}
+
+#[tokio::test]
+async fn hermes_key_without_secret_store_is_memory_only() {
+    let h = Harness::start().await;
+    let (s, v) = h
+        .put("/api/settings/hermes", json!({"api_key": "sk-mem"}))
+        .await;
+    assert_eq!(s, 200);
+    assert_eq!(
+        (v["has_key"].clone(), v["key_persisted"].clone()),
+        (json!(true), json!(false))
+    );
+    assert!(!v.to_string().contains("sk-mem"));
+    let (_, v) = h.put("/api/settings/hermes", json!({"api_key": ""})).await;
+    assert_eq!(v["has_key"], false);
     h.shutdown().await;
 }

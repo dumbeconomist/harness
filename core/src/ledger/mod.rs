@@ -23,6 +23,7 @@ pub struct LedgerEntry {
 #[derive(Debug, Serialize, PartialEq)]
 pub struct ModelTotal {
     pub model: String,
+    pub priced: bool,
     pub usd: f64,
     pub tokens: i64,
 }
@@ -36,6 +37,8 @@ pub struct DayTotal {
 #[derive(Debug, Serialize, PartialEq)]
 pub struct Summary {
     pub total_usd: f64,
+    pub total_tokens: i64,
+    pub unpriced_runs: i64,
     pub by_model: Vec<ModelTotal>,
     pub by_day: Vec<DayTotal>,
 }
@@ -110,8 +113,10 @@ pub fn summary(conn: &Connection) -> ApiResult<Summary> {
     )?;
     let by_model = st
         .query_map([], |r| {
+            let model: String = r.get(0)?;
             Ok(ModelTotal {
-                model: r.get(0)?,
+                priced: prices::price_for(&model).is_some(),
+                model,
                 usd: r.get(1)?,
                 tokens: r.get(2)?,
             })
@@ -128,8 +133,16 @@ pub fn summary(conn: &Connection) -> ApiResult<Summary> {
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
+    let (total_tokens, unpriced_runs): (i64, i64) = conn.query_row(
+        "SELECT COALESCE(SUM(prompt_tokens + completion_tokens), 0),
+                COALESCE(SUM(source = 'unpriced'), 0) FROM ledger",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
     Ok(Summary {
         total_usd,
+        total_tokens,
+        unpriced_runs,
         by_model,
         by_day,
     })
@@ -160,6 +173,9 @@ mod tests {
         let s = summary(&c).unwrap();
         assert!((s.total_usd - 18.0).abs() < 1e-9);
         assert_eq!(s.by_model.len(), 2);
+        assert_eq!(s.total_tokens, 2_001_000);
+        assert_eq!(s.unpriced_runs, 1);
+        assert!(s.by_model[0].priced && !s.by_model[1].priced);
         assert_eq!(s.by_model[0].model, "claude-sonnet-4");
         assert_eq!(s.by_model[0].tokens, 2_000_000);
         assert_eq!(s.by_day.len(), 2);

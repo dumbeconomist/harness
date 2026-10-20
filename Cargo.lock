@@ -5108,6 +5108,7 @@ dependencies = [
 name = "workbench-tauri"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "keyring",
  "serde_json",
  "tauri",

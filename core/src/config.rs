@@ -2,14 +2,23 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context};
 
+use crate::secrets::SecretStore;
+
 #[derive(Clone)]
 pub struct Config {
     pub addr: SocketAddr,
+    /// UI token (accepted only on `/api/*`).
     pub token: Option<String>,
+    /// MCP token (accepted only on `/mcp`).
+    pub mcp_token: Option<String>,
+    /// Set by the shell when it could not bind the preferred port.
+    pub addr_fallback: bool,
+    pub secret_store: Option<Arc<dyn SecretStore>>,
     pub data_dir: PathBuf,
     pub hermes_url: String,
     pub hermes_api_key: Option<String>,
@@ -22,6 +31,9 @@ impl std::fmt::Debug for Config {
         f.debug_struct("Config")
             .field("addr", &self.addr)
             .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field("mcp_token", &self.mcp_token.as_ref().map(|_| "<redacted>"))
+            .field("addr_fallback", &self.addr_fallback)
+            .field("secret_store", &self.secret_store.as_ref().map(|_| "<set>"))
             .field("data_dir", &self.data_dir)
             .field("hermes_url", &self.hermes_url)
             .field(
@@ -34,7 +46,7 @@ impl std::fmt::Debug for Config {
 }
 
 pub const DEFAULT_ADDR: &str = "127.0.0.1:8765";
-pub const DEFAULT_HERMES_URL: &str = "http://127.0.0.1:8642/v1";
+pub const DEFAULT_HERMES_URL: &str = "http://127.0.0.1:8643/v1";
 pub const DEFAULT_APPROVAL_TIMEOUT_SECS: u64 = 300;
 
 fn default_data_dir(home: Option<String>) -> PathBuf {
@@ -68,6 +80,9 @@ impl Config {
         Ok(Config {
             addr,
             token: nonempty("WORKBENCH_TOKEN"),
+            mcp_token: nonempty("WORKBENCH_MCP_TOKEN"),
+            addr_fallback: false,
+            secret_store: None,
             data_dir: nonempty("WORKBENCH_DATA_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| default_data_dir(get("HOME"))),
@@ -123,6 +138,7 @@ mod tests {
         let c = Config::from_lookup(lookup(&[
             ("WORKBENCH_ADDR", "127.0.0.1:0"),
             ("WORKBENCH_TOKEN", "t"),
+            ("WORKBENCH_MCP_TOKEN", "m"),
             ("WORKBENCH_DATA_DIR", "/d"),
             ("HERMES_URL", "http://x/v1"),
             ("HERMES_API_KEY", "k"),
@@ -131,6 +147,7 @@ mod tests {
         .unwrap();
         assert_eq!(c.addr.port(), 0);
         assert_eq!(c.token.as_deref(), Some("t"));
+        assert_eq!(c.mcp_token.as_deref(), Some("m"));
         assert_eq!(c.data_dir, PathBuf::from("/d"));
         assert_eq!(c.approval_timeout, Duration::from_secs(1));
         assert!(Config::from_lookup(lookup(&[("WORKBENCH_ADDR", "nope")])).is_err());
@@ -141,11 +158,12 @@ mod tests {
     fn debug_redacts_secrets() {
         let c = Config::from_lookup(lookup(&[
             ("WORKBENCH_TOKEN", "supersecret"),
+            ("WORKBENCH_MCP_TOKEN", "mcpsecret"),
             ("HERMES_API_KEY", "keysecret"),
         ]))
         .unwrap();
         let d = format!("{c:?}");
-        assert!(!d.contains("supersecret") && !d.contains("keysecret"));
+        assert!(!d.contains("supersecret") && !d.contains("keysecret") && !d.contains("mcpsecret"));
     }
 
     #[test]

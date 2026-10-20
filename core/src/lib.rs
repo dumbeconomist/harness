@@ -14,6 +14,7 @@ pub mod ledger;
 pub mod mcp;
 pub mod objects;
 pub mod policy;
+pub mod secrets;
 pub mod state;
 pub mod tools;
 
@@ -30,7 +31,10 @@ pub use config::Config;
 
 pub struct RunningServer {
     pub addr: std::net::SocketAddr,
+    /// UI token (`/api/*` only).
     pub token: String,
+    /// MCP token (`/mcp` only).
+    pub mcp_token: String,
     shutdown_flag: watch::Sender<bool>,
     shutdown_tx: oneshot::Sender<()>,
     join: JoinHandle<()>,
@@ -49,6 +53,22 @@ impl RunningServer {
             join.abort();
         }
     }
+}
+
+/// Explicit value wins (not written); else reuse the persisted file; else generate + persist.
+fn resolve_token(explicit: Option<String>, path: &Path) -> anyhow::Result<String> {
+    if let Some(t) = explicit {
+        return Ok(t);
+    }
+    if let Ok(existing) = std::fs::read_to_string(path) {
+        let t = existing.trim();
+        if !t.is_empty() {
+            return Ok(t.to_string());
+        }
+    }
+    let t = generate_token();
+    write_token_file(path, &t)?;
+    Ok(t)
 }
 
 fn generate_token() -> String {
@@ -86,14 +106,8 @@ pub async fn serve(config: Config) -> anyhow::Result<RunningServer> {
     std::fs::create_dir_all(&config.data_dir)
         .with_context(|| format!("creating data dir {}", config.data_dir.display()))?;
 
-    let token = match config.token.clone() {
-        Some(t) => t,
-        None => {
-            let t = generate_token();
-            write_token_file(&config.data_dir.join("token"), &t)?;
-            t
-        }
-    };
+    let token = resolve_token(config.token.clone(), &config.data_dir.join("token"))?;
+    let mcp_token = resolve_token(config.mcp_token.clone(), &config.data_dir.join("mcp_token"))?;
 
     let db = db::Db::open(&config.data_dir.join("workbench.db")).context("opening database")?;
     let events = events::Events::new();
@@ -102,12 +116,29 @@ pub async fn serve(config: Config) -> anyhow::Result<RunningServer> {
         .expire_stale()
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let brain = Arc::new(brain::HermesBrain::new(
-        &config.hermes_url,
-        config.hermes_api_key.clone(),
-        std::env::var("HERMES_MODEL")
-            .ok()
-            .filter(|m| !m.trim().is_empty()),
+    let hermes_model = std::env::var("HERMES_MODEL")
+        .ok()
+        .filter(|m| !m.trim().is_empty());
+    // A URL the user saved in Settings wins over the configured default.
+    let saved_url = db
+        .with(|c| db::get_setting(c, "hermes"))
+        .ok()
+        .flatten()
+        .and_then(|v| v["url"].as_str().map(String::from));
+    let hermes = state::HermesRuntime {
+        url: saved_url.unwrap_or_else(|| config.hermes_url.clone()),
+        api_key: config.hermes_api_key.clone().or_else(|| {
+            config
+                .secret_store
+                .as_ref()
+                .and_then(|s| s.get(secrets::HERMES_API_KEY))
+                .filter(|k| !k.is_empty())
+        }),
+    };
+    let brain: Arc<dyn brain::Brain> = Arc::new(brain::HermesBrain::new(
+        &hermes.url,
+        hermes.api_key.clone(),
+        hermes_model.clone(),
     ));
 
     let listener = tokio::net::TcpListener::bind(config.addr)
@@ -122,7 +153,11 @@ pub async fn serve(config: Config) -> anyhow::Result<RunningServer> {
         approvals,
         config,
         token: token.clone(),
-        brain,
+        mcp_token: mcp_token.clone(),
+        addr,
+        brain: std::sync::RwLock::new(brain),
+        hermes: std::sync::RwLock::new(hermes),
+        hermes_model,
         http: reqwest::Client::new(),
         shutdown: flag_rx,
     });
@@ -143,6 +178,7 @@ pub async fn serve(config: Config) -> anyhow::Result<RunningServer> {
     Ok(RunningServer {
         addr,
         token,
+        mcp_token,
         shutdown_flag: flag_tx,
         shutdown_tx: tx,
         join,

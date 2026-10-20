@@ -53,7 +53,9 @@ export interface LedgerEntry {
 
 export interface LedgerSummary {
   total_usd: number;
-  by_model: { model: string; usd: number; tokens: number }[];
+  total_tokens?: number;
+  unpriced_runs?: number;
+  by_model: { model: string; usd: number; tokens: number; priced?: boolean }[];
   by_day: { day: string; usd: number }[];
 }
 
@@ -61,6 +63,22 @@ export interface Health {
   ok: boolean;
   version: string;
   hermes: { reachable: boolean };
+  addr?: string;
+  addr_fallback?: boolean;
+}
+
+export interface HermesSettings {
+  url: string;
+  has_key: boolean;
+  key_persisted: boolean;
+  reachable: boolean;
+  model?: string;
+}
+
+export interface ConnectionInfo {
+  mcp_url: string;
+  mcp_token: string;
+  hermes_config_snippet: string;
 }
 
 export const PERMISSION_KEYS = ['web', 'files', 'mail', 'terminal', 'calendar', 'code'] as const;

@@ -8,7 +8,8 @@ use serde_json::Value;
 
 use crate::error::ApiResult;
 
-const MIGRATIONS: &[&str] = &[r#"
+const MIGRATIONS: &[&str] = &[
+    r#"
 CREATE TABLE tasks(
   id TEXT PRIMARY KEY,
   title TEXT NOT NULL,
@@ -57,7 +58,9 @@ CREATE TABLE settings(
   key TEXT PRIMARY KEY,
   value_json TEXT NOT NULL
 );
-"#];
+"#,
+    "ALTER TABLE journal ADD COLUMN args_hash TEXT;",
+];
 
 #[derive(Clone)]
 pub struct Db(Arc<Mutex<Connection>>);

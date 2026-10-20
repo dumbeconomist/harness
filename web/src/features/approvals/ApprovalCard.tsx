@@ -1,41 +1,118 @@
-import { useEffect, useRef, useState } from 'react';
-import { parseJsonish, type Approval } from '../../lib/types';
+import { useEffect, useRef, useState, type KeyboardEvent } from 'react';
+import { parseJsonish, type Approval, type Task } from '../../lib/types';
 
 export function tierLabel(tier: number): string {
   return tier >= 2 ? 'Destructive / external' : 'Change';
 }
 
-export function argsPreview(a: Approval['args_json'], max = 400): string {
+/** Full, untruncated, pretty-printed arguments. */
+export function argsFull(a: Approval['args_json']): string {
   const obj = parseJsonish(a);
-  const s = obj ? JSON.stringify(obj, null, 2) : typeof a === 'string' ? a : '';
-  return s.length > max ? `${s.slice(0, max)}…` : s;
+  return obj ? JSON.stringify(obj, null, 2) : typeof a === 'string' ? a : '';
+}
+
+interface Change {
+  field: string;
+  from: string;
+  to: string;
+}
+
+/** For tasks_update: old → new for each field that actually changes, using the task from the store. */
+export function computeChanges(approval: Approval, tasks: Task[]): { target: Task | null; changes: Change[] } {
+  const args = parseJsonish(approval.args_json);
+  const id = typeof args?.id === 'string' ? args.id : null;
+  const target = id ? (tasks.find((t) => t.id === id) ?? null) : null;
+  const changes: Change[] = [];
+  if (approval.tool === 'tasks_update' && args && target) {
+    for (const f of ['title', 'notes', 'status'] as const) {
+      const v = args[f];
+      if (typeof v === 'string' && v !== target[f]) changes.push({ field: f, from: target[f], to: v });
+    }
+  }
+  return { target, changes };
+}
+
+export function ApprovalDetail({ approval, tasks }: { approval: Approval; tasks: Task[] }) {
+  const { target, changes } = computeChanges(approval, tasks);
+  return (
+    <>
+      {approval.tool === 'tasks_delete' && target && (
+        <div className="ac-diff" data-testid="ac-target">
+          Will delete task <strong>{target.title}</strong>
+          {target.notes && <div className="muted">Notes: {target.notes}</div>}
+        </div>
+      )}
+      {changes.length > 0 && (
+        <ul className="ac-diff" data-testid="ac-changes">
+          {changes.map((c) => (
+            <li key={c.field}>
+              <span className="muted">{c.field}:</span> <del>{c.from || '(empty)'}</del> → <ins>{c.to || '(empty)'}</ins>
+            </li>
+          ))}
+        </ul>
+      )}
+      <details className="ac-details" open>
+        <summary>Full arguments</summary>
+        <pre className="ac-args" data-testid="ac-args">
+          {argsFull(approval.args_json)}
+        </pre>
+      </details>
+    </>
+  );
 }
 
 interface CardProps {
   approval: Approval;
   pendingCount: number;
+  tasks?: Task[];
+  /** Ignore decisions this long after mount (accidental-keystroke guard). */
+  guardMs?: number;
   onDecide: (decision: 'approve' | 'deny', note?: string) => void | Promise<void>;
 }
 
 /**
- * Floating, non-modal approval card. ⌘/Ctrl+Enter approves, Esc denies — handled at window level
- * so the user never has to find focus first.
+ * Floating, non-modal approval card.
+ * Safety rules: never takes focus; keyboard acts only when focus is inside the card; repeat events
+ * and anything within guardMs of mount are ignored; Esc collapses (never denies); tier 2 needs an
+ * explicit "Review" expand before it can be approved.
  */
-export function ApprovalCard({ approval, pendingCount, onDecide }: CardProps) {
+export function ApprovalCard({ approval, pendingCount, tasks = [], guardMs = 600, onDecide }: CardProps) {
+  const tier2 = approval.tier >= 2;
   const [note, setNote] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const noteRef = useRef(note);
-  noteRef.current = note;
+  const [collapsed, setCollapsed] = useState(false);
+  const [reviewed, setReviewed] = useState(!tier2);
+  // Buttons render disabled until the guard elapses, so an early click is visibly inert, not silently dropped.
+  const [armed, setArmed] = useState(guardMs <= 0);
+  const mountedAt = useRef(Date.now());
   const busyRef = useRef(false);
+  const rootRef = useRef<HTMLElement>(null);
+
+  useEffect(() => {
+    mountedAt.current = Date.now();
+    const focus = () => {
+      setCollapsed(false);
+      window.setTimeout(() => rootRef.current?.focus(), 0);
+    };
+    window.addEventListener('workbench:focus-approval', focus);
+    const arm = window.setTimeout(() => setArmed(true), guardMs);
+    return () => {
+      window.removeEventListener('workbench:focus-approval', focus);
+      window.clearTimeout(arm);
+    };
+  }, [guardMs]);
+
+  const guarded = () => Date.now() - mountedAt.current < guardMs;
 
   const decide = async (decision: 'approve' | 'deny') => {
-    if (busyRef.current) return;
+    if (busyRef.current || guarded()) return;
+    if (decision === 'approve' && !reviewed) return;
     busyRef.current = true;
     setBusy(true);
     setError(null);
     try {
-      await onDecide(decision, noteRef.current.trim() || undefined);
+      await onDecide(decision, note.trim() || undefined);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Decision failed');
     } finally {
@@ -43,68 +120,89 @@ export function ApprovalCard({ approval, pendingCount, onDecide }: CardProps) {
       setBusy(false);
     }
   };
-  const decideRef = useRef(decide);
-  decideRef.current = decide;
 
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.defaultPrevented) return;
-      if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
-        e.preventDefault();
-        void decideRef.current('approve');
-      } else if (e.key === 'Escape') {
-        e.preventDefault();
-        void decideRef.current('deny');
-      }
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, []);
+  const onKeyDown = (e: KeyboardEvent<HTMLElement>) => {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
+      setCollapsed(true);
+      return;
+    }
+    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+      e.preventDefault();
+      if (e.repeat || guarded()) return;
+      void decide('approve');
+    }
+  };
 
-  const preview = argsPreview(approval.args_json);
+  if (collapsed) {
+    return (
+      <button className={`approval-badge tier-${tier2 ? 2 : 1}`} data-testid="approval-badge" onClick={() => setCollapsed(false)}>
+        {pendingCount} approval{pendingCount === 1 ? '' : 's'} waiting — Review
+      </button>
+    );
+  }
+
   return (
-    <aside className={`approval-card tier-${approval.tier >= 2 ? 2 : 1}`} role="alertdialog" aria-label="Approval needed" data-testid="approval-card">
+    <aside
+      ref={rootRef}
+      tabIndex={-1}
+      onKeyDown={onKeyDown}
+      className={`approval-card tier-${tier2 ? 2 : 1}`}
+      role="group"
+      aria-label="Approval needed"
+      data-testid="approval-card"
+    >
       <div className="ac-head">
         <span className="ac-kicker">Approval needed</span>
-        <span className={`badge tier-${approval.tier >= 2 ? 2 : 1}`} data-testid="tier-badge">
+        <span className={`badge tier-${tier2 ? 2 : 1}`} data-testid="tier-badge">
           Tier {approval.tier} · {tierLabel(approval.tier)}
         </span>
+        <button className="icon-btn" aria-label="Collapse approval" title="Collapse (Esc)" onClick={() => setCollapsed(true)}>
+          –
+        </button>
       </div>
       <div className="ac-tool">
         <code>{approval.tool}</code>
         <span className="muted"> requested by {approval.requested_by || 'agent'}</span>
       </div>
       <p className="ac-summary">{approval.summary}</p>
-      {preview && <pre className="ac-args">{preview}</pre>}
-      <input
-        className="ac-note"
-        aria-label="Note (optional)"
-        placeholder="Add a note (optional)"
-        value={note}
-        onChange={(e) => setNote(e.target.value)}
-        onKeyDown={(e) => {
-          // typing in the note must not trigger Esc→deny by accident; Esc just blurs
-          if (e.key === 'Escape') {
-            e.preventDefault();
-            e.stopPropagation();
-            (e.target as HTMLInputElement).blur();
-          }
-        }}
-      />
+      {reviewed ? (
+        <ApprovalDetail approval={approval} tasks={tasks} />
+      ) : (
+        <p className="muted">This is a destructive action. Review the details before you can approve it.</p>
+      )}
+      {reviewed && (
+        <input
+          className="ac-note"
+          aria-label="Note (optional)"
+          placeholder="Add a note (optional)"
+          value={note}
+          onChange={(e) => setNote(e.target.value)}
+        />
+      )}
       {error && (
         <p className="inline-error" role="alert">
           {error}
         </p>
       )}
       <div className="ac-actions">
-        <button className="btn danger" onClick={() => void decide('deny')} disabled={busy} data-testid="deny-btn">
-          Deny <kbd>⎋</kbd>
+        <button className="btn danger" onClick={() => void decide('deny')} disabled={busy || !armed} data-testid="deny-btn">
+          Deny
         </button>
-        <button className="btn primary" onClick={() => void decide('approve')} disabled={busy} data-testid="approve-btn" autoFocus>
-          Approve <kbd>⌘↵</kbd>
-        </button>
+        {reviewed ? (
+          <button className="btn primary" onClick={() => void decide('approve')} disabled={busy || !armed} data-testid="approve-btn">
+            Approve <kbd>⌘↵</kbd>
+          </button>
+        ) : (
+          <button className="btn primary" onClick={() => setReviewed(true)} data-testid="review-btn">
+            Review
+          </button>
+        )}
       </div>
-      {pendingCount > 1 && <div className="ac-more muted">+{pendingCount - 1} more waiting</div>}
+      <div className="ac-more muted">
+        {pendingCount > 1 ? `+${pendingCount - 1} more waiting · ` : ''}Esc collapses · shortcuts work when this card is focused
+      </div>
     </aside>
   );
 }

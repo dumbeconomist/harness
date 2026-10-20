@@ -17,6 +17,7 @@ pub struct Harness {
     pub server: RunningServer,
     pub base: String,
     pub token: String,
+    pub mcp_token: String,
     pub client: reqwest::Client,
     pub dir: tempfile::TempDir,
 }
@@ -25,6 +26,9 @@ pub fn config(dir: &std::path::Path, timeout_secs: u64, hermes_url: &str) -> Con
     Config {
         addr: "127.0.0.1:0".parse().unwrap(),
         token: Some("test-token".into()),
+        mcp_token: Some("test-mcp-token".into()),
+        addr_fallback: false,
+        secret_store: None,
         data_dir: dir.to_path_buf(),
         hermes_url: hermes_url.to_string(),
         hermes_api_key: Some("hermes-secret".into()),
@@ -45,6 +49,7 @@ impl Harness {
         Harness {
             base: format!("http://{}", server.addr),
             token: server.token.clone(),
+            mcp_token: server.mcp_token.clone(),
             server,
             client: reqwest::Client::new(),
             dir,
@@ -58,7 +63,11 @@ impl Harness {
     pub fn req(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
         self.client
             .request(method, self.url(path))
-            .bearer_auth(&self.token)
+            .bearer_auth(if path.starts_with("/mcp") {
+                &self.mcp_token
+            } else {
+                &self.token
+            })
     }
 
     pub async fn get(&self, path: &str) -> Value {

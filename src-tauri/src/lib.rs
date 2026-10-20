@@ -12,56 +12,35 @@ use tauri::{
 };
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
+#[cfg(target_os = "macos")]
 const KEYCHAIN_SERVICE: &str = "dev.harness.workbench";
-const KEYCHAIN_ACCOUNT: &str = "hermes-api-key";
 
 /// Holds the running core so it can be shut down on exit.
 struct CoreHandle(Mutex<Option<workbench_core::RunningServer>>);
 
 // ---------------------------------------------------------------- keychain
 
+/// macOS Keychain-backed secret store handed to core (`Config.secret_store`).
+/// Core's PUT /api/settings/hermes is the single path for writing the Hermes key.
+/// Values are never logged.
 #[cfg(target_os = "macos")]
-fn keychain_entry() -> Result<keyring::Entry, String> {
-    keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT).map_err(|e| e.to_string())
-}
+struct KeychainStore;
 
 #[cfg(target_os = "macos")]
-fn read_hermes_key() -> Option<String> {
-    keychain_entry()
-        .ok()?
-        .get_password()
-        .ok()
-        .filter(|k| !k.is_empty())
-}
-
-#[cfg(not(target_os = "macos"))]
-fn read_hermes_key() -> Option<String> {
-    None
-}
-
-/// Store the Hermes API key in the macOS Keychain. Takes effect on next app start.
-#[tauri::command]
-fn set_hermes_key(key: String) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    {
-        let entry = keychain_entry()?;
-        if key.is_empty() {
-            // Clearing: ignore "no entry" errors.
-            let _ = entry.delete_credential();
-            return Ok(());
-        }
-        entry.set_password(&key).map_err(|e| e.to_string())
+impl workbench_core::SecretStore for KeychainStore {
+    fn get(&self, k: &str) -> Option<String> {
+        keyring::Entry::new(KEYCHAIN_SERVICE, k)
+            .ok()?
+            .get_password()
+            .ok()
+            .filter(|v| !v.is_empty())
     }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = key;
-        Err("Keychain is only available on macOS".into())
-    }
-}
 
-#[tauri::command]
-fn has_hermes_key() -> bool {
-    read_hermes_key().is_some()
+    fn set(&self, k: &str, v: &str) -> anyhow::Result<()> {
+        let entry = keyring::Entry::new(KEYCHAIN_SERVICE, k)?;
+        entry.set_password(v)?;
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------- window
@@ -94,17 +73,36 @@ pub fn run() {
                 })
                 .build(),
         )
-        .invoke_handler(tauri::generate_handler![set_hermes_key, has_hermes_key])
+        .on_window_event(|window, event| {
+            // macOS convention: closing the window hides it to the tray; Quit (tray / Cmd+Q) exits.
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        })
         .setup(|app| {
             // --- start core in-process on a random loopback port
             let mut config = workbench_core::Config::from_env()?;
-            config.addr = "127.0.0.1:0".parse()?;
             config.data_dir = app.path().app_data_dir()?;
-            if let Some(key) = read_hermes_key() {
-                config.hermes_api_key = Some(key);
-            }
             std::fs::create_dir_all(&config.data_dir)?;
-            let server = tauri::async_runtime::block_on(workbench_core::serve(config))?;
+            // Keychain only on macOS; elsewhere keys stay memory-only.
+            #[cfg(target_os = "macos")]
+            {
+                config.secret_store = Some(std::sync::Arc::new(KeychainStore));
+            }
+            // Stable address 127.0.0.1:8765 (what the Hermes profile points at); if busy,
+            // fall back to a random port and flag it so the UI can warn.
+            config.addr = "127.0.0.1:8765".parse()?;
+            let server = match tauri::async_runtime::block_on(workbench_core::serve(config.clone()))
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("workbench: 127.0.0.1:8765 unavailable ({e}); using a random port");
+                    config.addr = "127.0.0.1:0".parse()?;
+                    config.addr_fallback = true;
+                    tauri::async_runtime::block_on(workbench_core::serve(config))?
+                }
+            };
             let base_url = format!("http://{}", server.addr);
             let init = format!(
                 "window.__WORKBENCH__ = {};",
@@ -151,6 +149,11 @@ pub fn run() {
         .expect("error while building Hermes Workbench");
 
     app.run(|app, event| {
+        #[cfg(target_os = "macos")]
+        if let RunEvent::Reopen { .. } = event {
+            show_main_window(app);
+            return;
+        }
         if let RunEvent::Exit = event {
             if let Some(state) = app.try_state::<CoreHandle>() {
                 if let Some(server) = state.0.lock().ok().and_then(|mut g| g.take()) {

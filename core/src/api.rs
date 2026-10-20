@@ -19,7 +19,9 @@ use tokio_stream::wrappers::{BroadcastStream, ReceiverStream};
 use tower_http::cors::{AllowHeaders, AllowOrigin, CorsLayer};
 
 use crate::approvals;
+use crate::brain;
 use crate::brain::{BrainEvent, ChatMessage, ChatRequest};
+use crate::db;
 use crate::db::new_id;
 use crate::error::{ApiError, ApiResult};
 use crate::journal;
@@ -27,8 +29,11 @@ use crate::ledger;
 use crate::mcp;
 use crate::objects::tasks;
 use crate::policy;
+use crate::secrets;
+use crate::state::HermesRuntime;
 use crate::state::SharedState;
 use crate::tools;
+use std::sync::Arc;
 
 // ---------------------------------------------------------------- helpers
 
@@ -89,14 +94,18 @@ fn limit_param(q: &HashMap<String, String>, default: usize) -> ApiResult<usize> 
 // ------------------------------------------------------------------- auth
 
 async fn auth(State(st): State<SharedState>, req: Request, next: Next) -> Response {
+    let path = req.uri().path();
+    let is_mcp = path == "/mcp" || path.starts_with("/mcp/");
+    // Two credentials: the UI token only opens /api/*, the MCP token only /mcp.
+    let expected = if is_mcp { &st.mcp_token } else { &st.token };
     let bearer_ok = req
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .map(|t| ct_eq(t.trim(), &st.token))
+        .map(|t| ct_eq(t.trim(), expected))
         .unwrap_or(false);
-    let query_ok = req.uri().path() == "/api/events"
+    let query_ok = path == "/api/events"
         && req
             .uri()
             .query()
@@ -105,6 +114,12 @@ async fn auth(State(st): State<SharedState>, req: Request, next: Next) -> Respon
             .unwrap_or(false);
     if !(bearer_ok || query_ok) {
         return ApiError::unauthorized().into_response();
+    }
+    // Browsers only: foreign origins are refused even with a valid token.
+    if let Some(origin) = req.headers().get(header::ORIGIN) {
+        if !origin.to_str().map(origin_is_local).unwrap_or(false) {
+            return ApiError::forbidden("origin not allowed").into_response();
+        }
     }
     next.run(req).await
 }
@@ -129,6 +144,8 @@ pub fn router(state: SharedState) -> Router {
             "/api/settings/policies",
             get(get_policies).put(put_policies),
         )
+        .route("/api/settings/hermes", get(get_hermes).put(put_hermes))
+        .route("/api/settings/connection", get(get_connection))
         .route("/api/chat", post(chat))
         .route("/api/events", get(events))
         .route(
@@ -164,18 +181,102 @@ pub fn router(state: SharedState) -> Router {
 
 // ----------------------------------------------------------------- health
 
-async fn health(State(st): State<SharedState>) -> Json<Value> {
-    let url = format!("{}/models", st.config.hermes_url.trim_end_matches('/'));
+/// Any HTTP answer (even 401) from `{url}/models` means Hermes is up.
+async fn probe_hermes(st: &SharedState, h: &HermesRuntime) -> bool {
+    let url = format!("{}/models", h.url.trim_end_matches('/'));
     let mut rb = st.http.get(url).timeout(Duration::from_millis(1500));
-    if let Some(k) = &st.config.hermes_api_key {
+    if let Some(k) = &h.api_key {
         rb = rb.bearer_auth(k);
     }
-    // Any HTTP answer (even 401) means the server is up.
-    let reachable = rb.send().await.is_ok();
+    rb.send().await.is_ok()
+}
+
+async fn health(State(st): State<SharedState>) -> Json<Value> {
+    let reachable = probe_hermes(&st, &st.hermes()).await;
     Json(json!({
         "ok": true,
         "version": env!("CARGO_PKG_VERSION"),
+        "addr": st.addr.to_string(),
+        "addr_fallback": st.config.addr_fallback,
         "hermes": {"reachable": reachable},
+    }))
+}
+
+// --------------------------------------------------------- hermes settings
+
+async fn hermes_view(st: &SharedState) -> Value {
+    let h = st.hermes();
+    let has_key = h.api_key.is_some();
+    let key_persisted = has_key
+        && st
+            .config
+            .secret_store
+            .as_ref()
+            .is_some_and(|s| s.get(secrets::HERMES_API_KEY) == h.api_key);
+    json!({
+        "url": h.url,
+        "has_key": has_key,
+        "key_persisted": key_persisted,
+        "reachable": probe_hermes(st, &h).await,
+        "model": st.hermes_model.clone().unwrap_or_else(|| brain::DEFAULT_MODEL.to_string()),
+    })
+}
+
+async fn get_hermes(State(st): State<SharedState>) -> Json<Value> {
+    Json(hermes_view(&st).await)
+}
+
+#[derive(Deserialize)]
+struct HermesBody {
+    url: Option<String>,
+    api_key: Option<String>,
+}
+
+async fn put_hermes(
+    State(st): State<SharedState>,
+    ApiJson(body): ApiJson<HermesBody>,
+) -> ApiResult<Json<Value>> {
+    let mut cur = st.hermes();
+    if let Some(u) = body.url {
+        let u = u.trim().trim_end_matches('/').to_string();
+        if !(u.starts_with("http://") || u.starts_with("https://")) || u.len() < 9 {
+            return Err(ApiError::bad_request(
+                "url must start with http:// or https://",
+            ));
+        }
+        st.db
+            .with(|c| db::set_setting(c, "hermes", &json!({"url": u})))?;
+        cur.url = u;
+    }
+    if let Some(k) = body.api_key {
+        let k = k.trim().to_string();
+        if let Some(store) = &st.config.secret_store {
+            if let Err(e) = store.set(secrets::HERMES_API_KEY, &k) {
+                tracing::warn!("could not persist the Hermes API key: {e}");
+            }
+        }
+        cur.api_key = if k.is_empty() { None } else { Some(k) };
+    }
+    let new_brain: Arc<dyn brain::Brain> = Arc::new(brain::HermesBrain::new(
+        &cur.url,
+        cur.api_key.clone(),
+        st.hermes_model.clone(),
+    ));
+    *st.hermes.write().unwrap_or_else(|e| e.into_inner()) = cur;
+    *st.brain.write().unwrap_or_else(|e| e.into_inner()) = new_brain;
+    Ok(Json(hermes_view(&st).await))
+}
+
+async fn get_connection(State(st): State<SharedState>) -> Json<Value> {
+    let url = st.mcp_url();
+    let snippet = format!(
+        "mcp_servers:\n  workbench:\n    url: \"{url}\"\n    headers:\n      Authorization: \"Bearer {}\"\n    timeout: 600\n    connect_timeout: 30\n",
+        st.mcp_token
+    );
+    Json(json!({
+        "mcp_url": url,
+        "mcp_token": st.mcp_token,
+        "hermes_config_snippet": snippet,
     }))
 }
 
@@ -187,6 +288,20 @@ async fn list_tasks(
 ) -> ApiResult<Json<Vec<tasks::Task>>> {
     let status = q.get("status").cloned();
     Ok(Json(st.db.with(|c| tasks::list(c, status.as_deref()))?))
+}
+
+/// Keep only the editable task fields (clients may send a whole Task back).
+fn pick_task_fields(body: &Value, id: Option<&str>) -> Value {
+    let mut out = serde_json::Map::new();
+    for k in ["title", "notes", "status", "goal_id"] {
+        if let Some(v) = body.get(k).filter(|v| !v.is_null()) {
+            out.insert(k.into(), v.clone());
+        }
+    }
+    if let Some(id) = id {
+        out.insert("id".into(), json!(id));
+    }
+    Value::Object(out)
 }
 
 fn task_from_result(v: &Value) -> ApiResult<Value> {
@@ -202,7 +317,8 @@ async fn create_task(
     if !body.is_object() {
         return Err(ApiError::bad_request("expected a JSON object"));
     }
-    let j = tools::execute_journaled(&st, "tasks_create", &body, "user", None, None)?;
+    let args = pick_task_fields(&body, None);
+    let j = tools::execute_journaled(&st, "tasks_create", &args, "user", None, None)?;
     Ok(Json(task_from_result(&j.entry.result_json)?))
 }
 
@@ -211,19 +327,11 @@ async fn update_task(
     Path(id): Path<String>,
     ApiJson(body): ApiJson<Value>,
 ) -> ApiResult<Json<Value>> {
-    let mut args = body
-        .as_object()
-        .cloned()
-        .ok_or_else(|| ApiError::bad_request("expected a JSON object"))?;
-    args.insert("id".into(), json!(id));
-    let j = tools::execute_journaled(
-        &st,
-        "tasks_update",
-        &Value::Object(args),
-        "user",
-        None,
-        None,
-    )?;
+    if !body.is_object() {
+        return Err(ApiError::bad_request("expected a JSON object"));
+    }
+    let args = pick_task_fields(&body, Some(&id));
+    let j = tools::execute_journaled(&st, "tasks_update", &args, "user", None, None)?;
     Ok(Json(task_from_result(&j.entry.result_json)?))
 }
 
@@ -406,7 +514,7 @@ async fn chat(
         }
     }
 
-    let mut upstream = st.brain.chat_stream(ChatRequest {
+    let mut upstream = st.brain().chat_stream(ChatRequest {
         messages,
         model: None,
         session_id: body.session_id,

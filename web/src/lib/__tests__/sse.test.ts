@@ -31,6 +31,18 @@ describe('SSE parser', () => {
 
 const cfg = { baseUrl: 'http://x', token: 't' };
 
+describe('tool status mapping', () => {
+  it('passes failed and maps unknown statuses to unknown', async () => {
+    const enc = new TextEncoder();
+    const f = vi.fn().mockResolvedValue(
+      new Response(new ReadableStream({ start(c) { c.enqueue(enc.encode('event: tool\ndata: {"tool":"t","status":"failed"}\n\nevent: tool\ndata: {"tool":"t","status":"weird"}\n\nevent: done\ndata: {}\n\n')); c.close(); } })),
+    );
+    const onTool = vi.fn();
+    await streamChat(cfg, { messages: [] }, { onDelta: vi.fn(), onDone: vi.fn(), onTool, onError: vi.fn() }, undefined, f);
+    expect(onTool.mock.calls).toEqual([['t', 'failed'], ['t', 'unknown']]);
+  });
+});
+
 describe('tool events', () => {
   it('parser yields tool events; streamChat routes them and ignores unknown events', async () => {
     const enc = new TextEncoder();

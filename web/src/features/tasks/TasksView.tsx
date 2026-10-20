@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type KeyboardEvent } from 'react';
+import { TaskDetail } from './TaskDetail';
 import { TASK_STATUSES, type Task, type TaskStatus } from '../../lib/types';
 
 export const STATUS_LABEL: Record<TaskStatus, string> = {
@@ -18,9 +19,11 @@ interface Props {
   onCreate: (title: string) => Promise<void> | void;
   onStatus: (id: string, status: TaskStatus) => Promise<void> | void;
   onRetry?: () => void;
+  onUpdate?: (id: string, patch: Partial<Pick<Task, 'title' | 'notes' | 'status'>>) => Promise<void> | void;
+  onDelete?: (id: string) => Promise<void> | void;
 }
 
-export function TasksView({ tasks, loaded, error, selectedId, onSelect, onCreate, onStatus, onRetry }: Props) {
+export function TasksView({ tasks, loaded, error, selectedId, onSelect, onCreate, onStatus, onRetry, onUpdate, onDelete }: Props) {
   const [title, setTitle] = useState('');
   const [busy, setBusy] = useState(false);
   const [addError, setAddError] = useState<string | null>(null);
@@ -61,6 +64,7 @@ export function TasksView({ tasks, loaded, error, selectedId, onSelect, onCreate
     }
   };
 
+  const selectedTask = tasks.find((t) => t.id === selectedId) ?? null;
   const groups = GROUP_ORDER.map((s) => ({ status: s, items: tasks.filter((t) => t.status === s) })).filter(
     (g) => g.items.length > 0,
   );
@@ -108,6 +112,9 @@ export function TasksView({ tasks, loaded, error, selectedId, onSelect, onCreate
           <strong>No tasks yet</strong>
           <p>Add one above, or ask Hermes in the side pane to “add a task to buy milk”.</p>
         </div>
+      )}
+      {selectedTask && onUpdate && onDelete && (
+        <TaskDetail key={`${selectedTask.id}:${selectedTask.updated_at}`} task={selectedTask} onUpdate={onUpdate} onDelete={onDelete} />
       )}
       <ul className="task-list" onKeyDown={onListKey}>
         {groups.map((g) => (

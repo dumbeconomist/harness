@@ -1,7 +1,7 @@
 //! MCP server: JSON-RPC 2.0 over streamable HTTP (single JSON responses).
 
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::{json, Value};
@@ -120,29 +120,7 @@ pub async fn handle_message(state: &SharedState, msg: Value) -> Option<Value> {
     })
 }
 
-fn origin_allowed(headers: &HeaderMap) -> bool {
-    match headers.get("origin").and_then(|v| v.to_str().ok()) {
-        None => true,
-        Some(o) => crate::api::origin_is_local(o),
-    }
-}
-
-pub async fn post_mcp(
-    State(state): State<SharedState>,
-    headers: HeaderMap,
-    body: axum::body::Bytes,
-) -> Response {
-    if !origin_allowed(&headers) {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(rpc_error(
-                Value::Null,
-                INVALID_REQUEST,
-                "origin not allowed",
-            )),
-        )
-            .into_response();
-    }
+pub async fn post_mcp(State(state): State<SharedState>, body: axum::body::Bytes) -> Response {
     let msg: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {

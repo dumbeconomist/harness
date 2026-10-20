@@ -52,9 +52,11 @@ export function createSseParser(onMessage: (m: SseMessage) => void) {
 export interface ChatHandlers {
   onDelta: (text: string) => void;
   onDone: (usage: unknown) => void;
-  onTool?: (tool: string, status: 'running' | 'completed') => void;
+  onTool?: (tool: string, status: ToolStatus) => void;
   onError: (message: string) => void;
 }
+
+export type ToolStatus = 'running' | 'completed' | 'failed' | 'unknown';
 
 export const HERMES_UNREACHABLE = 'Hermes unreachable — check Settings';
 
@@ -109,7 +111,8 @@ export async function streamChat(
         if (text) handlers.onDelta(text);
       } else if (m.event === 'tool') {
         const tool = typeof payload?.tool === 'string' ? payload.tool : '';
-        const status = payload?.status === 'completed' ? 'completed' : 'running';
+        const raw = payload?.status;
+        const status: ToolStatus = raw === 'running' || raw === 'completed' || raw === 'failed' ? raw : 'unknown';
         if (tool) handlers.onTool?.(tool, status);
       } else if (m.event === 'done') {
         finish(() => handlers.onDone(payload?.usage ?? payload));

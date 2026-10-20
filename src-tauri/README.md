@@ -18,8 +18,8 @@ Production build: `cd src-tauri && npx tauri build --target aarch64-apple-darwin
 (`.github/workflows/macos-build.yml`) with ad-hoc signing; right-click > Open the first time.
 
 ## Keychain
-Commands `set_hermes_key(key)` / `has_hermes_key()`. The key is read at startup and passed to core
-as `hermes_api_key`; changing it needs an app restart. Never logged.
+Core gets a `KeychainStore` (service `dev.harness.workbench`) as `Config.secret_store`; the key is written via core `PUT /api/settings/hermes`, hot-swapped, no restart
+Never logged. Core binds 127.0.0.1:8765, falling back to a random port (`addr_fallback`). Closing the window hides it to the tray.
 
 ## macOS-only / not buildable on Linux
 The whole crate needs WebKit (Linux needs WebKitGTK) and is excluded from default workspace members.

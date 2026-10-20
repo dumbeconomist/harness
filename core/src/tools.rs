@@ -28,27 +28,37 @@ impl From<ApiError> for ToolResult {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ListArgs {
     status: Option<String>,
 }
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreateArgs {
     title: String,
     notes: Option<String>,
     status: Option<String>,
     goal_id: Option<String>,
+    #[allow(dead_code)]
+    idempotency_key: Option<String>,
 }
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UpdateArgs {
     id: String,
     title: Option<String>,
     notes: Option<String>,
     status: Option<String>,
     goal_id: Option<String>,
+    #[allow(dead_code)]
+    idempotency_key: Option<String>,
 }
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DeleteArgs {
     id: String,
+    #[allow(dead_code)]
+    idempotency_key: Option<String>,
 }
 
 fn parse_args<T: serde::de::DeserializeOwned>(args: &Value) -> ApiResult<T> {
@@ -210,25 +220,50 @@ fn exec(conn: &Connection, tool: &str, args: &Value) -> ApiResult<Executed> {
             )?;
             Ok(Executed {
                 result: json!({"task": t}),
-                inverse: Some(json!({"op": "delete", "id": t.id})),
+                inverse: Some(
+                    json!({"op": "delete", "id": t.id, "after_updated_at": t.updated_at}),
+                ),
                 change: Some(("created", t.id.clone(), Some(t))),
             })
         }
         "tasks_update" => {
             let a: UpdateArgs = parse_args(args)?;
-            let (before, after) = tasks::update(
-                conn,
-                &a.id,
-                TaskPatch {
-                    title: a.title,
-                    notes: a.notes,
-                    status: a.status,
-                    goal_id: a.goal_id,
-                },
-            )?;
+            let patch = TaskPatch {
+                title: a.title,
+                notes: a.notes,
+                status: a.status,
+                goal_id: a.goal_id,
+            };
+            // Field-level "before": only the fields this call touches.
+            let (has_title, has_notes, has_status, has_goal) = (
+                patch.title.is_some(),
+                patch.notes.is_some(),
+                patch.status.is_some(),
+                patch.goal_id.is_some(),
+            );
+            let (before, after) = tasks::update(conn, &a.id, patch)?;
+            let mut fields = serde_json::Map::new();
+            if has_title {
+                fields.insert("title".into(), json!(before.title));
+            }
+            if has_notes {
+                fields.insert("notes".into(), json!(before.notes));
+            }
+            if has_status {
+                fields.insert("status".into(), json!(before.status));
+            }
+            if has_goal {
+                fields.insert("goal_id".into(), json!(before.goal_id));
+            }
             Ok(Executed {
                 result: json!({"task": after}),
-                inverse: Some(json!({"op": "restore", "task": before})),
+                inverse: Some(json!({
+                    "op": "restore",
+                    "id": after.id,
+                    "before": fields,
+                    "before_updated_at": before.updated_at,
+                    "after_updated_at": after.updated_at,
+                })),
                 change: Some(("updated", after.id.clone(), Some(after))),
             })
         }
@@ -252,6 +287,8 @@ pub struct Journaled {
     pub replayed: bool,
 }
 
+const KEY_REUSED: &str = "idempotency key reused with different arguments";
+
 /// Execute a write tool and journal it atomically. Emits events afterwards.
 pub fn execute_journaled(
     state: &SharedState,
@@ -261,9 +298,13 @@ pub fn execute_journaled(
     approval_id: Option<&str>,
     key: Option<&str>,
 ) -> ApiResult<Journaled> {
+    let hash = journal::args_hash(tool, args);
     let outcome = state.db.with(|conn| {
         if let Some(k) = key {
             if let Some(prev) = journal::find_by_key(conn, k)? {
+                if prev.tool != tool || prev.args_hash.as_deref().is_some_and(|h| h != hash) {
+                    return Err(ApiError::conflict(KEY_REUSED));
+                }
                 return Ok((
                     Journaled {
                         entry: prev,
@@ -285,6 +326,7 @@ pub fn execute_journaled(
                 approval_id,
                 key,
                 inverse: ex.inverse.as_ref(),
+                args_hash: Some(&hash),
             },
         )?;
         tx.commit()?;
@@ -310,6 +352,83 @@ pub fn execute_journaled(
     Ok(journaled)
 }
 
+enum Pre {
+    Replay(Value),
+    Go {
+        summary: String,
+        policy: policy::Policy,
+        key: String,
+    },
+}
+
+/// Decide whether this call replays an earlier one, and compute the key under
+/// which a fresh execution will be journaled.
+fn idempotency(
+    conn: &Connection,
+    tool: &str,
+    args: &Value,
+    hash: &str,
+) -> ApiResult<Result<String, Value>> {
+    if let Some(k) = args
+        .get("idempotency_key")
+        .and_then(Value::as_str)
+        .filter(|k| !k.is_empty())
+    {
+        return match journal::find_by_key(conn, k)? {
+            Some(prev) => {
+                if prev.tool != tool || prev.args_hash.as_deref().is_some_and(|h| h != hash) {
+                    Err(ApiError::bad_request(KEY_REUSED))
+                } else {
+                    Ok(Err(prev.result_json))
+                }
+            }
+            None => Ok(Ok(k.to_string())),
+        };
+    }
+    if tool == "tasks_create" {
+        let key = journal::derive_key(tool, args, None);
+        if let Some(prev) = journal::find_by_key(conn, &key)? {
+            // Only a replay while the created object still exists, unchanged.
+            let created = &prev.result_json["task"];
+            let same = created["id"]
+                .as_str()
+                .and_then(|id| tasks::get(conn, id).ok().flatten())
+                .is_some_and(|t| Some(t.updated_at.as_str()) == created["updated_at"].as_str());
+            if same {
+                return Ok(Err(prev.result_json));
+            }
+            journal::release_key(conn, &prev.id)?;
+        }
+        return Ok(Ok(key));
+    }
+    // update / delete: bound to the target's current state.
+    let id = args.get("id").and_then(Value::as_str).unwrap_or_default();
+    match tasks::get(conn, id)? {
+        Some(t) => {
+            let key = journal::derive_key(tool, args, Some(&t.updated_at));
+            if let Some(prev) = journal::find_by_key(conn, &key)? {
+                return Ok(Err(prev.result_json));
+            }
+            // A retry of a call that already produced the current state.
+            if tool == "tasks_update" {
+                if let Some(prev) = journal::find_by_effect(conn, tool, hash, &t.updated_at)? {
+                    return Ok(Err(prev.result_json));
+                }
+            }
+            Ok(Ok(key))
+        }
+        None => {
+            // Object gone: a retry of a delete we just did is a replay.
+            if tool == "tasks_delete" {
+                if let Some(prev) = journal::find_recent_by_hash(conn, tool, hash)? {
+                    return Ok(Err(prev.result_json));
+                }
+            }
+            Err(ApiError::not_found(format!("task '{id}' not found")))
+        }
+    }
+}
+
 /// Handle an MCP `tools/call`. `Err` means "unknown tool" (a protocol error);
 /// everything else is a tool result.
 pub async fn call(state: &SharedState, name: &str, args: Value) -> Result<ToolResult, ApiError> {
@@ -320,9 +439,20 @@ pub async fn call(state: &SharedState, name: &str, args: Value) -> Result<ToolRe
         return Ok(ToolResult::Error("arguments must be an object".into()));
     }
 
-    // 1. Validate (no side effects) + summary + switch + policy, under one lock.
+    // 1. Validate (no side effects), switch, policy, idempotency: one lock.
+    let hash = journal::args_hash(name, &args);
     let pre = state.db.with(|conn| {
-        prepare(conn, name, &args)?;
+        match prepare(conn, name, &args) {
+            Ok(()) => {}
+            Err(e) if e.status == 404 && name == "tasks_delete" => {
+                // possibly a retry of a delete that already happened
+                if let Some(prev) = journal::find_recent_by_hash(conn, name, &hash)? {
+                    return Ok(Pre::Replay(prev.result_json));
+                }
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        }
         if let Some(sw) = def.switch {
             if !policy::switch_enabled(conn, sw)? {
                 return Err(ApiError::forbidden(format!(
@@ -330,11 +460,30 @@ pub async fn call(state: &SharedState, name: &str, args: Value) -> Result<ToolRe
                 )));
             }
         }
-        let pol = policy::effective_policy(conn, name)?;
-        Ok((summarize(conn, name, &args), pol))
+        if def.tier == 0 {
+            return Ok(Pre::Go {
+                summary: String::new(),
+                policy: policy::Policy::Ask,
+                key: String::new(),
+            });
+        }
+        let key = match idempotency(conn, name, &args, &hash)? {
+            Ok(k) => k,
+            Err(stored) => return Ok(Pre::Replay(stored)),
+        };
+        Ok(Pre::Go {
+            summary: summarize(conn, name, &args),
+            policy: policy::effective_policy(conn, name)?,
+            key,
+        })
     });
-    let (summary, pol) = match pre {
-        Ok(v) => v,
+    let (summary, pol, key) = match pre {
+        Ok(Pre::Go {
+            summary,
+            policy,
+            key,
+        }) => (summary, policy, key),
+        Ok(Pre::Replay(v)) => return Ok(ToolResult::Ok(v)),
         Err(e) => return Ok(e.into()),
     };
 
@@ -344,19 +493,6 @@ pub async fn call(state: &SharedState, name: &str, args: Value) -> Result<ToolRe
             Ok(ex) => ToolResult::Ok(ex.result),
             Err(e) => e.into(),
         });
-    }
-
-    // 2. Idempotency.
-    let key = args
-        .get("idempotency_key")
-        .and_then(Value::as_str)
-        .filter(|k| !k.is_empty())
-        .map(String::from)
-        .unwrap_or_else(|| journal::derive_key(name, &args));
-    match state.db.with(|c| journal::find_by_key(c, &key)) {
-        Ok(Some(prev)) => return Ok(ToolResult::Ok(prev.result_json)),
-        Ok(None) => {}
-        Err(e) => return Ok(e.into()),
     }
 
     // 3. Gate.
@@ -453,7 +589,9 @@ mod tests {
         let id = ex.result["task"]["id"].as_str().unwrap().to_string();
         assert_eq!(ex.inverse.unwrap()["op"], "delete");
         let ex = exec(&c, "tasks_update", &json!({"id": id, "status": "done"})).unwrap();
-        assert_eq!(ex.inverse.unwrap()["task"]["status"], "todo");
+        let inv = ex.inverse.unwrap();
+        assert_eq!(inv["before"]["status"], "todo");
+        assert!(inv["after_updated_at"].is_string());
         let ex = exec(&c, "tasks_list", &json!({"status": "done"})).unwrap();
         assert_eq!(ex.result["tasks"].as_array().unwrap().len(), 1);
         let ex = exec(&c, "tasks_delete", &json!({"id": id})).unwrap();

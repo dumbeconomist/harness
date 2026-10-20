@@ -37,7 +37,7 @@ export function LedgerView({ summary }: { summary: LedgerSummary | null }) {
       </header>
       {!summary ? (
         <div className="state muted">Loading ledger…</div>
-      ) : summary.by_model.length === 0 && summary.total_usd === 0 ? (
+      ) : summary.by_model.length === 0 && summary.total_usd === 0 && !summary.total_tokens ? (
         <div className="state empty">
           <strong>No spend recorded</strong>
           <p>Chat with Hermes and each run’s token cost shows up here.</p>
@@ -47,7 +47,18 @@ export function LedgerView({ summary }: { summary: LedgerSummary | null }) {
           <div className="total" data-testid="ledger-total">
             <span className="muted">Total spend</span>
             <strong>{usd(summary.total_usd)}</strong>
+            {summary.total_tokens != null && (
+              <span className="muted" data-testid="ledger-tokens">
+                {summary.total_tokens.toLocaleString()} tokens
+              </span>
+            )}
           </div>
+          {(summary.unpriced_runs ?? 0) > 0 && (
+            <p className="inline-warn" data-testid="ledger-unpriced-note">
+              {summary.unpriced_runs} run{summary.unpriced_runs === 1 ? '' : 's'} used a model with no price on file, so the
+              total above understates real spend.
+            </p>
+          )}
           <h2 className="group-title">By model</h2>
           <table className="table">
             <thead>
@@ -60,7 +71,14 @@ export function LedgerView({ summary }: { summary: LedgerSummary | null }) {
             <tbody>
               {summary.by_model.map((m) => (
                 <tr key={m.model}>
-                  <td>{m.model}</td>
+                  <td>
+                    {m.model}{' '}
+                    {(m.priced === false || m.usd === 0) && (
+                      <span className="badge unpriced" data-testid="unpriced-badge" title="No price on file for this model">
+                        unpriced
+                      </span>
+                    )}
+                  </td>
                   <td className="num">{m.tokens.toLocaleString()}</td>
                   <td className="num">{usd(m.usd)}</td>
                 </tr>

@@ -90,7 +90,10 @@ export function App() {
     const onKey = (e: KeyboardEvent) => {
       const mod = e.metaKey || e.ctrlKey;
       if (!mod) return;
-      if (e.key.toLowerCase() === 'k') {
+      if (e.shiftKey && e.key.toLowerCase() === 'a') {
+        e.preventDefault();
+        window.dispatchEvent(new Event('workbench:focus-approval'));
+      } else if (e.key.toLowerCase() === 'k') {
         e.preventDefault();
         setPaletteOpen((o) => !o);
       } else if (e.key.toLowerCase() === 'j') {
@@ -147,11 +150,21 @@ export function App() {
     if (topApproval) {
       list.push(
         {
+          id: 'focus-approval',
+          title: 'Review pending approval',
+          hint: '⌘⇧A',
+          keywords: 'approval card focus',
+          run: () => window.setTimeout(() => window.dispatchEvent(new Event('workbench:focus-approval')), 50),
+        },
+        ...(topApproval.tier >= 2
+          ? []
+          : [
+        {
           id: 'approve-top',
           title: `Approve: ${topApproval.summary || topApproval.tool}`,
           keywords: 'approve top pending yes',
           run: () => void decide(topApproval.id, 'approve').catch((e) => flash(String(e))),
-        },
+        }]),
         {
           id: 'deny-top',
           title: `Deny: ${topApproval.summary || topApproval.tool}`,
@@ -207,6 +220,12 @@ export function App() {
             Connection to Workbench lost — retrying…
           </div>
         )}
+        {data.health?.addr_fallback && (
+          <div className="banner info" role="status" data-testid="addr-fallback-banner">
+            Hermes is configured for :8765 but Workbench is on :{data.health.addr?.split(':').pop() ?? '?'} — update the
+            connection in Settings.
+          </div>
+        )}
         <div className="main-bar">
           <span />
           {!chatOpen && (
@@ -228,10 +247,19 @@ export function App() {
             onCreate={createTask}
             onStatus={setStatus}
             onRetry={() => void refresh.tasks()}
+            onUpdate={async (id, patch) => {
+              await api.updateTask(id, patch);
+              await Promise.all([refresh.tasks(), refresh.journal()]);
+            }}
+            onDelete={async (id) => {
+              await api.deleteTask(id);
+              setSelectedId(null);
+              await Promise.all([refresh.tasks(), refresh.journal()]);
+            }}
           />
         )}
         {view === 'approvals' && (
-          <ApprovalsView approvals={data.approvals} onDecide={(id, d) => decide(id, d).catch((e) => flash(String(e)))} />
+          <ApprovalsView approvals={data.approvals} tasks={data.tasks} onDecide={(id, d) => decide(id, d).catch((e) => flash(String(e)))} />
         )}
         {view === 'journal' && (
           <JournalView entries={data.journal} onUndo={undo} onOpenApproval={() => setView('approvals')} />
@@ -253,6 +281,7 @@ export function App() {
         <ApprovalCard
           key={topApproval.id}
           approval={topApproval}
+          tasks={data.tasks}
           pendingCount={data.approvals.length}
           onDecide={(d, note) => decide(topApproval.id, d, note)}
         />

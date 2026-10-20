@@ -58,6 +58,21 @@ fn row(r: &Row) -> rusqlite::Result<Task> {
     })
 }
 
+/// A timestamp strictly later than `prev` (so edits are always detectable).
+fn next_ts(prev: &str) -> String {
+    let n = now();
+    if n.as_str() > prev {
+        return n;
+    }
+    chrono::DateTime::parse_from_rfc3339(prev)
+        .map(|t| {
+            (t + chrono::Duration::milliseconds(1))
+                .with_timezone(&chrono::Utc)
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        })
+        .unwrap_or(n)
+}
+
 pub fn validate_title(title: &str) -> ApiResult<String> {
     let t = title.trim();
     if t.is_empty() {
@@ -197,7 +212,7 @@ pub fn update(conn: &Connection, id: &str, patch: TaskPatch) -> ApiResult<(Task,
     if let Some(g) = patch.goal_id {
         after.goal_id = Some(g);
     }
-    after.updated_at = now();
+    after.updated_at = next_ts(&before.updated_at);
     replace(conn, &after)?;
     Ok((before, after))
 }
