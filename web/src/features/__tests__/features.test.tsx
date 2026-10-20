@@ -1,4 +1,4 @@
-import { render, screen, waitFor, fireEvent } from '@testing-library/react';
+import { act, render, screen, waitFor, fireEvent } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 import { ApprovalCard } from '../approvals/ApprovalCard';
@@ -92,7 +92,7 @@ describe('ApprovalCard', () => {
     fireEvent.keyDown(screen.getByLabelText('Note (optional)'), { key: 'Enter', metaKey: true });
     await userEvent.click(screen.getByTestId('approve-btn'));
     expect(onDecide).not.toHaveBeenCalled();
-    await new Promise((r) => setTimeout(r, 650));
+    await act(async () => void (await new Promise((r) => setTimeout(r, 650))));
     await userEvent.click(screen.getByTestId('approve-btn'));
     expect(onDecide).toHaveBeenCalledTimes(1);
   });
@@ -259,6 +259,12 @@ describe('SettingsView', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Save' }));
     expect(api.putHermes).toHaveBeenCalledWith({ url: 'http://z/v1', api_key: 'k1' });
   });
+  it('Clear key sends an empty api_key', async () => {
+    const api = mkApi();
+    render(<SettingsView api={api} health={null} />);
+    await userEvent.click(await screen.findByRole('button', { name: 'Clear key' }));
+    expect(api.putHermes).toHaveBeenCalledWith({ api_key: '' });
+  });
   it('connection snippet is hidden until revealed', async () => {
     render(<SettingsView api={mkApi()} health={null} />);
     expect(screen.queryByTestId('mcp-snippet')).toBeNull();
@@ -279,7 +285,7 @@ function within2(el: HTMLElement) {
 }
 
 describe('tier-2 keyboard hardening', () => {
-  const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  const wait = (ms: number) => act(async () => void (await new Promise((r) => setTimeout(r, ms))));
   it('Review then Enter,Enter / Space does not approve; focus leaves the button', async () => {
     const onDecide = vi.fn().mockResolvedValue(undefined);
     render(<ApprovalCard approval={approval({ tier: 2, tool: 'tasks_delete', args_json: '{"id":"t1"}' })} pendingCount={1} guardMs={80} tasks={[task()]} onDecide={onDecide} />);
@@ -296,19 +302,53 @@ describe('tier-2 keyboard hardening', () => {
     await userEvent.keyboard('{Enter} {Enter}');
     expect(onDecide).not.toHaveBeenCalled();
   });
-  it('keyboard-activated Approve click (detail 0) is ignored for tier 2, pointer click works', async () => {
+  it('keyboard-activated Confirm (detail 0) needs the opt-in box for tier 2', async () => {
     const onDecide = vi.fn().mockResolvedValue(undefined);
     render(<ApprovalCard approval={approval({ tier: 2 })} pendingCount={1} guardMs={0} onDecide={onDecide} />);
     await userEvent.click(screen.getByTestId('review-btn'));
+    expect(screen.getByTestId('approve-btn')).toHaveTextContent('Confirm');
     fireEvent.click(screen.getByTestId('approve-btn'), { detail: 0 });
     expect(onDecide).not.toHaveBeenCalled();
-    await userEvent.click(screen.getByTestId('approve-btn'));
-    expect(onDecide).toHaveBeenCalledTimes(1);
+    await userEvent.click(screen.getByLabelText(/Allow keyboard/));
+    fireEvent.click(screen.getByTestId('approve-btn'), { detail: 0 });
+    await waitFor(() => expect(onDecide).toHaveBeenCalledTimes(1));
+  });
+});
+
+describe('round-4 guards', () => {
+  const wait = (ms: number) => act(async () => void (await new Promise((r) => setTimeout(r, ms))));
+  it('Review is inert during the mount guard and Approve is not rendered with it', async () => {
+    render(<ApprovalCard approval={approval({ tier: 2 })} pendingCount={1} guardMs={80} onDecide={vi.fn()} />);
+    expect(screen.getByTestId('review-btn')).toBeDisabled();
+    expect(screen.queryByTestId('approve-btn')).toBeNull();
+    await wait(120);
+    expect(screen.getByTestId('review-btn')).toBeEnabled();
+  });
+  it('after Review the tier-2 re-arm is 1000ms', async () => {
+    render(<ApprovalCard approval={approval({ tier: 2 })} pendingCount={1} guardMs={50} onDecide={vi.fn()} />);
+    await wait(80);
+    await userEvent.click(screen.getByTestId('review-btn'));
+    expect(screen.getByTestId('approve-btn')).toBeDisabled();
+    await wait(600);
+    expect(screen.getByTestId('approve-btn')).toBeDisabled();
+    await wait(500);
+    expect(screen.getByTestId('approve-btn')).toBeEnabled();
+  });
+  it('re-arms all rows when the id set changes', async () => {
+    const onDecide = vi.fn();
+    const rows = [approval({ id: 'a1' }), approval({ id: 'a2' }), approval({ id: 'a3' })];
+    const { rerender } = render(<ApprovalsView guardMs={80} onDecide={onDecide} approvals={rows} />);
+    await wait(120);
+    expect(screen.getAllByTestId('row-approve')[0]).toBeEnabled();
+    rerender(<ApprovalsView guardMs={80} onDecide={onDecide} approvals={rows.slice(1)} />);
+    screen.getAllByTestId('row-approve').forEach((b) => expect(b).toBeDisabled());
+    await wait(120);
+    screen.getAllByTestId('row-approve').forEach((b) => expect(b).toBeEnabled());
   });
 });
 
 describe('ApprovalsView guards', () => {
-  const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  const wait = (ms: number) => act(async () => void (await new Promise((r) => setTimeout(r, ms))));
   it('double-click on row 1 cannot approve row 2; rows are inert after a decision', async () => {
     const onDecide = vi.fn().mockResolvedValue(undefined);
     render(<ApprovalsView guardMs={100} onDecide={onDecide} approvals={[approval({ id: 'a1' }), approval({ id: 'a2' })]} />);

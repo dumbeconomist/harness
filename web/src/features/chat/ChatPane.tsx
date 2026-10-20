@@ -119,7 +119,7 @@ export function ChatPane({ cfg, context, contextLabel, hidden, onOpenSettings, o
         </button>
       </header>
       <div className="chat-log" ref={logRef} role="log" aria-live="polite">
-        {messages.length === 0 && (
+        {messages.length === 0 && !slot && (
           <div className="state empty">
             <strong>{context ? 'Ask about this task' : 'Ask Hermes anything'}</strong>
             <p>Hermes can propose changes — you approve each one before it happens.</p>

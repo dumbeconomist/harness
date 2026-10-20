@@ -75,6 +75,21 @@ export function SettingsView({ api = defaultApi, health, onRefreshHealth }: Prop
     }
   };
 
+  const clearKey = async () => {
+    setSaving(true);
+    try {
+      setHermes(await api.putHermes({ api_key: '' }));
+      setKeyDraft('');
+      setSaved(true);
+      setError(null);
+      onRefreshHealth?.();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
   const revealConn = async () => {
     if (!conn) {
       try {
@@ -178,9 +193,16 @@ export function SettingsView({ api = defaultApi, health, onRefreshHealth }: Prop
               : 'Loading…'}
             {saved && ' · saved'}
           </span>
-          <button className="btn primary" disabled={saving} onClick={() => void saveHermes()}>
-            {saving ? 'Saving…' : 'Save'}
-          </button>
+          <span className="row gap">
+            {hermes?.has_key && (
+              <button className="btn" disabled={saving} onClick={() => void clearKey()}>
+                Clear key
+              </button>
+            )}
+            <button className="btn primary" disabled={saving} onClick={() => void saveHermes()}>
+              {saving ? 'Saving…' : 'Save'}
+            </button>
+          </span>
         </div>
         {hermes?.has_key && !hermes.key_persisted && (
           <p className="inline-warn" data-testid="key-not-persisted">

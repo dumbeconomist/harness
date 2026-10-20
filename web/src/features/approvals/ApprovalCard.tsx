@@ -61,18 +61,32 @@ export function ApprovalDetail({ approval, tasks }: { approval: Approval; tasks:
   );
 }
 
-/** Returns [ready, rearm]. `ready` is false for `ms` after mount and after every rearm(). */
-export function useArm(ms: number): [boolean, () => void] {
+/** Returns [ready, rearm]. `ready` is false for `ms` after mount and after every rearm(optionalMs). */
+export function useArm(ms: number): [boolean, (nextMs?: number) => void] {
   const [epoch, setEpoch] = useState(0);
+  const dur = useRef(ms);
   const [ready, setReady] = useState(ms <= 0);
   useEffect(() => {
-    if (ms <= 0) return;
+    const d = dur.current;
+    if (d <= 0) {
+      setReady(true);
+      return;
+    }
     setReady(false);
-    const t = window.setTimeout(() => setReady(true), ms);
+    const t = window.setTimeout(() => setReady(true), d);
     return () => window.clearTimeout(t);
-  }, [ms, epoch]);
-  return [ready, () => setEpoch((e) => e + 1)];
+  }, [epoch]);
+  return [
+    ready,
+    (next?: number) => {
+      dur.current = next ?? ms;
+      setEpoch((e) => e + 1);
+    },
+  ];
 }
+
+/** After "Review" on a tier-2 card, Approve stays inert this long (never shorter than the mount guard). */
+export const REVIEW_REARM_MS = 1000;
 
 interface CardProps {
   docked?: boolean;
@@ -97,6 +111,7 @@ export function ApprovalCard({ docked = false, approval, pendingCount, tasks = [
   const [error, setError] = useState<string | null>(null);
   const [collapsed, setCollapsed] = useState(false);
   const [reviewed, setReviewed] = useState(!tier2);
+  const [kbdOk, setKbdOk] = useState(false);
   const mountedAt = useRef(Date.now());
   const busyRef = useRef(false);
   const rootRef = useRef<HTMLElement>(null);
@@ -119,8 +134,9 @@ export function ApprovalCard({ docked = false, approval, pendingCount, tasks = [
 
   const review = () => {
     setReviewed(true);
-    mountedAt.current = Date.now(); // re-arm: Approve is inert for guardMs after Review
-    rearm();
+    const ms = guardMs <= 0 ? 0 : Math.max(REVIEW_REARM_MS, guardMs);
+    mountedAt.current = Date.now() + ms - guardMs; // re-arm: Approve is inert for ms after Review
+    rearm(ms);
     window.setTimeout(() => rootRef.current?.focus(), 0); // never leave focus on a button that becomes Approve
   };
 
@@ -189,7 +205,19 @@ export function ApprovalCard({ docked = false, approval, pendingCount, tasks = [
       {reviewed ? (
         <ApprovalDetail approval={approval} tasks={tasks} />
       ) : (
-        <p className="muted">This is a destructive action. Review the details before you can approve it.</p>
+        <>
+          <p className="muted">This is a destructive action. Review the details before you can approve it.</p>
+          {/* Review lives in the body, full width — never where Approve will appear */}
+          <button
+            key="review"
+            className="btn review-wide"
+            onClick={review}
+            disabled={busy || !ready}
+            data-testid="review-btn"
+          >
+            Review details
+          </button>
+        </>
       )}
       {reviewed && (
         <input
@@ -200,6 +228,12 @@ export function ApprovalCard({ docked = false, approval, pendingCount, tasks = [
           onChange={(e) => setNote(e.target.value)}
         />
       )}
+      {reviewed && tier2 && (
+        <label className="ac-kbd muted">
+          <input type="checkbox" disabled={busy || !ready} checked={kbdOk} onChange={(e) => setKbdOk(e.target.checked)} /> Allow keyboard / screen-reader
+          confirmation
+        </label>
+      )}
       {error && (
         <p className="inline-error" role="alert">
           {error}
@@ -209,22 +243,19 @@ export function ApprovalCard({ docked = false, approval, pendingCount, tasks = [
         <button className="btn danger" onClick={() => void decide('deny')} disabled={busy || !ready} data-testid="deny-btn">
           Deny
         </button>
-        {reviewed ? (
+        {reviewed && (
           <button
             key="approve"
             className="btn primary"
             onClick={(e) => {
-              if (tier2 && e.detail === 0) return; // keyboard activation can't approve tier 2
+              // pointer click always counts; keyboard/assistive activation of a tier-2 approve needs the opt-in box
+              if (tier2 && e.detail === 0 && !kbdOk) return;
               void decide('approve');
             }}
             disabled={busy || !ready}
             data-testid="approve-btn"
           >
-            Approve <kbd>⌘↵</kbd>
-          </button>
-        ) : (
-          <button key="review" className="btn primary" onClick={review} data-testid="review-btn">
-            Review
+            {tier2 ? (approval.tool === 'tasks_delete' ? 'Confirm delete' : 'Confirm') : 'Approve'} <kbd>⌘↵</kbd>
           </button>
         )}
       </div>

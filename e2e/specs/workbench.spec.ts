@@ -1,7 +1,7 @@
 import { expect, test } from '@playwright/test';
 import fs from 'node:fs';
 import path from 'node:path';
-import { callTool, createTask, denyAll, listTaskTitles, pendingApprovals, toolText } from './helpers';
+import { callTool, callToolAbortable, createTask, denyAll, listTaskTitles, pendingApprovals, toolText } from './helpers';
 
 const SHOTS = path.resolve(__dirname, '../screenshots');
 fs.mkdirSync(SHOTS, { recursive: true });
@@ -392,5 +392,98 @@ test.describe('round-3 regressions: Review→Approve focus, list double-click, p
     await page.keyboard.press('Escape');
     await denyAll(request);
     await pending;
+  });
+});
+
+test.describe('round-4 regressions: same-spot click cadences, list shifts', () => {
+  type Req = Parameters<typeof callTool>[0];
+  type Pg = import('@playwright/test').Page;
+
+  const center = async (loc: import('@playwright/test').Locator) => {
+    const b = (await loc.boundingBox())!;
+    return { x: b.x + b.width / 2, y: b.y + b.height / 2 };
+  };
+  async function closeChat(page: Pg) {
+    await page.getByRole('button', { name: 'Hide Hermes pane' }).click();
+  }
+
+  for (const layout of ['docked', 'floating'] as const) {
+    test(`queue tier-1 A then tier-2 B: clicking one spot at 0/+300/+1000ms never deletes B (${layout})`, async ({ page, request }) => {
+      await page.goto('/');
+      if (layout === 'floating') await closeChat(page);
+      const a = await createTask(request, `Queue A ${Date.now()}`);
+      const b = await createTask(request, `Queue B ${Date.now()}`);
+      const pA = callTool(request, 'tasks_update', { id: a.id, title: `${a.title} v2` });
+      await expect.poll(async () => (await pendingApprovals(request)).length).toBe(1);
+      const pB = callTool(request, 'tasks_delete', { id: b.id });
+      await expect(page.getByTestId('approval-card').getByTestId('approve-btn')).toBeEnabled();
+      await page.waitForTimeout(800);
+      const spot = await center(page.getByTestId('approve-btn'));
+      await page.mouse.click(spot.x, spot.y); // t=0: approves A (intended)
+      await page.waitForTimeout(300);
+      await page.mouse.click(spot.x, spot.y);
+      await page.waitForTimeout(700);
+      await page.mouse.click(spot.x, spot.y); // +1000ms
+      await page.waitForTimeout(1200);
+      await page.mouse.click(spot.x, spot.y);
+      await page.waitForTimeout(500);
+      expect(await listTaskTitles(request)).toContain(b.title);
+      await page.screenshot({ path: shot(`18-queue-cadence-${layout}`) });
+      await denyAll(request);
+      await Promise.all([pA, pB]);
+      expect(await listTaskTitles(request)).toContain(b.title);
+    });
+
+    test(`single tier-2 card: Review then same-spot clicks at +650/+700/+1200ms never delete (${layout})`, async ({ page, request }) => {
+      await page.goto('/');
+      if (layout === 'floating') await closeChat(page);
+      const t = await createTask(request, `Solo ${Date.now()}`);
+      const pending = callTool(request, 'tasks_delete', { id: t.id });
+      const card = page.getByTestId('approval-card');
+      await expect(card).toBeVisible();
+      await expect(card.getByTestId('review-btn')).toBeEnabled();
+      const spot = await center(card.getByTestId('review-btn'));
+      await page.mouse.click(spot.x, spot.y);
+      await expect(card.getByTestId('approve-btn')).toBeVisible();
+      const approve = await center(card.getByTestId('approve-btn'));
+      expect(Math.abs(approve.y - spot.y)).toBeGreaterThan(30); // Approve never sits under the old Review spot
+      await page.waitForTimeout(650);
+      await page.mouse.click(spot.x, spot.y);
+      await page.waitForTimeout(50);
+      await page.mouse.click(spot.x, spot.y);
+      await page.waitForTimeout(500);
+      await page.mouse.click(spot.x, spot.y);
+      await page.waitForTimeout(500);
+      expect(await listTaskTitles(request)).toContain(t.title);
+      expect((await pendingApprovals(request)).length).toBe(1);
+      await page.screenshot({ path: shot(`19-review-spot-${layout}`) });
+      await denyAll(request);
+      await pending;
+    });
+  }
+
+  test('Approvals list: expiring R0 just before clicking R1 never approves R2', async ({ page, request }) => {
+    await page.goto('/');
+    const ts = [] as { id: string; title: string }[];
+    for (let i = 0; i < 3; i++) ts.push(await createTask(request, `Row ${i} ${Date.now()}`));
+    const calls: ReturnType<typeof callToolAbortable>[] = [];
+    for (let i = 0; i < 3; i++) {
+      calls.push(callToolAbortable('tasks_update', { id: ts[i]!.id, title: `${ts[i]!.title} v2` }));
+      await expect.poll(async () => (await pendingApprovals(request)).length).toBe(i + 1);
+    }
+    await page.getByRole('button', { name: /Approvals/ }).click();
+    await expect(page.getByTestId('approval-row')).toHaveCount(3);
+    await page.waitForTimeout(900);
+    const spot = await center(page.getByTestId('row-approve').nth(1));
+    calls[0]!.abort(); // requester disconnects → R0 expires and the list shifts up
+    await page.waitForTimeout(100);
+    await page.mouse.click(spot.x, spot.y);
+    await page.waitForTimeout(900);
+    const titles = await listTaskTitles(request);
+    expect(titles).not.toContain(`${ts[2]!.title} v2`); // R2 untouched
+    expect((await pendingApprovals(request)).length).toBeGreaterThanOrEqual(1);
+    await page.screenshot({ path: shot('20-list-shift') });
+    await denyAll(request);
+    await Promise.all(calls.map((c) => c.promise));
   });
 });

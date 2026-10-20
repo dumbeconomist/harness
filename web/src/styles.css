@@ -114,7 +114,7 @@ kbd { font: 11px var(--font); color: var(--text-dim); background: var(--bg-hover
 .icon-btn { border: 0; background: none; color: var(--text-dim); border-radius: 6px; padding: 2px 6px; }
 .icon-btn:hover { background: var(--bg-hover); }
 .link { border: 0; background: none; color: var(--accent); font: inherit; padding: 0 4px; cursor: pointer; }
-input[type='text'], input:not([type]), textarea, select {
+input[type='text'], input[type='password'], input:not([type]), textarea, select {
   font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px;
 }
 select { padding: 2px 4px; }
@@ -253,3 +253,7 @@ select { padding: 2px 4px; }
 .approval-badge.docked { position: static; display: block; margin: var(--s2) 0; width: 100%; box-shadow: none; }
 .card.highlight { outline: 2px solid var(--accent); }
 .btn:disabled.primary { filter: saturate(0.4); }
+
+.review-wide { display: block; width: 100%; margin: 6px 0; }
+.ac-actions { justify-content: space-between !important; }
+.ac-kbd { display: flex; gap: 6px; align-items: center; font-size: 12px; margin: 4px 0; }

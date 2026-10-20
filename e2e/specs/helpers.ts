@@ -41,3 +41,17 @@ export async function denyAll(request: APIRequestContext): Promise<void> {
     await request.post(`${CORE}/api/approvals/${a.id}/decision`, { headers: UI_AUTH, data: { decision: 'deny', note: 'cleanup' } });
   }
 }
+
+/** MCP tools/call via node fetch so the test can abort (simulating the requester disconnecting). */
+export function callToolAbortable(name: string, args: Record<string, unknown>) {
+  const ac = new AbortController();
+  const promise = fetch(`${CORE}/mcp`, {
+    method: 'POST',
+    headers: { ...MCP_AUTH, 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: Math.floor(Math.random() * 1e9), method: 'tools/call', params: { name, arguments: args } }),
+    signal: ac.signal,
+  })
+    .then((r) => r.json())
+    .catch(() => null);
+  return { promise, abort: () => ac.abort() };
+}
