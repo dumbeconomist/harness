@@ -1,0 +1,37 @@
+[package]
+name = "workbench-core"
+version = "0.1.0"
+edition = "2021"
+description = "Hermes Workbench core: objects, tools, approval gate, MCP server"
+license = "MIT"
+
+[lib]
+name = "workbench_core"
+path = "src/lib.rs"
+
+[[bin]]
+name = "workbench-core"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+async-stream = "0.3"
+axum = "0.7"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+futures = "0.3"
+hex = "0.4"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tower-http = { version = "0.5", features = ["cors"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v7", "v4"] }
+
+[dev-dependencies]
+tempfile = "3"

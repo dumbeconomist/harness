@@ -1,0 +1,83 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check -p workbench-core
+      - run: cargo clippy -p workbench-core --all-targets -- -D warnings
+      - run: cargo test -p workbench-core
+
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - run: pnpm -C web install --frozen-lockfile
+      - run: pnpm -C web typecheck
+      - run: pnpm -C web lint
+      - run: pnpm -C web test
+      - run: pnpm -C web build
+
+  mock-hermes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # Point at the file: `node --test <dir>` runs zero tests on Node 22.
+      - run: node --test tools/mock-hermes/server.test.js
+
+  e2e:
+    runs-on: ubuntu-latest
+    needs: [core, web]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: pnpm -C web install --frozen-lockfile
+      - run: pnpm -C web build
+      - run: pnpm -C e2e install --frozen-lockfile
+      - run: pnpm -C e2e exec playwright install --with-deps chromium
+      - run: pnpm -C e2e test
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-screenshots
+          path: |
+            e2e/screenshots
+            e2e/test-results
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: playwright-report
+          path: e2e/playwright-report
+          if-no-files-found: ignore

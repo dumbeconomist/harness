@@ -1,0 +1,57 @@
+name: macos-build
+
+on:
+  push:
+    branches: ["claude/**", main]
+  workflow_dispatch:
+
+concurrency:
+  group: macos-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-14 # Apple Silicon
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: pnpm -C web install --frozen-lockfile
+      - run: pnpm -C web build
+      - name: Install Tauri CLI
+        run: npm install --prefix src-tauri
+      # beforeBuildCommand (pnpm -C web build) also runs inside this step.
+      - name: Build app + dmg (ad-hoc signed)
+        working-directory: src-tauri
+        run: npx tauri build --target aarch64-apple-darwin
+        # --- Notarization (future) -----------------------------------------
+        # tauri.conf.json bundle.macOS.signingIdentity is "-" (ad-hoc). With an
+        # Apple Developer account, add repo secrets and uncomment:
+        # env:
+        #   APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}            # base64 .p12
+        #   APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        #   APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}  # "Developer ID Application: ..."
+        #   APPLE_ID: ${{ secrets.APPLE_ID }}
+        #   APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}                  # app-specific password
+        #   APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        # and change signingIdentity in tauri.conf.json (or drop it so the env var is used).
+        # See https://v2.tauri.app/distribute/sign/macos/
+      - name: Locate dmg
+        id: dmg
+        run: |
+          f=$(find . -path '*bundle/dmg/*' -name '*.dmg' -not -path '*/node_modules/*' | head -n1)
+          echo "Found: $f"
+          test -n "$f"
+          cp "$f" "HermesWorkbench-${GITHUB_SHA}.dmg"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HermesWorkbench-${{ github.sha }}.dmg
+          path: HermesWorkbench-${{ github.sha }}.dmg
