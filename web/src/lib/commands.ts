@@ -23,11 +23,12 @@ export type UiAction =
   | { type: 'new-task' }
   | { type: 'toggle-chat' }
   | { type: 'ask-in-chat'; text: string }
+  | { type: 'open-thread'; id: string }
   | { type: 'focus-approval' }
   | { type: 'open-task'; id: string };
 
 /** The only API surface commands get. No decision method exists here by construction. */
-export type CommandApi = Pick<Api, 'config' | 'createTask' | 'listTasks' | 'latestUndoable' | 'undo' | 'doctor'>;
+export type CommandApi = Pick<Api, 'config' | 'createTask' | 'listTasks' | 'latestUndoable' | 'undo' | 'doctor' | 'createThread'>;
 
 export interface CommandCtx {
   api: CommandApi;

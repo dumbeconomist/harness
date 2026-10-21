@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { Api } from '../../lib/api';
+import { relativeTime } from '../../lib/format';
 import type { Doctor, DoctorCheck } from '../../lib/types';
 
 export function firstProblem(d: Doctor | null): DoctorCheck | null {
@@ -9,26 +10,50 @@ export function firstProblem(d: Doctor | null): DoctorCheck | null {
 
 const LABEL: Record<DoctorCheck['status'], string> = { ok: 'OK', warn: 'Warning', fail: 'Failed', skip: 'Skipped' };
 
-/** App-wide strip shown while the doctor reports `ok: false`. Floats (no layout shift); dismissable for the session. */
-export function DoctorBanner({ doctor, onFix }: { doctor: Doctor | null; onFix: () => void }) {
-  const [dismissed, setDismissed] = useState(false);
-  const bad = firstProblem(doctor);
-  useEffect(() => {
-    if (!bad) setDismissed(false); // healthy again: next failure shows the banner afresh
-  }, [bad]);
-  if (!bad || dismissed) return null;
+const ISO_RE = /(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))/;
+
+/** Renders `backticked` text as <code> and ISO timestamps as relative times with the ISO string as a tooltip. */
+export function RichText({ text, now = Date.now() }: { text: string; now?: number }) {
+  const parts = text.split(/(`[^`]+`)/g);
   return (
-    <div className="doctor-banner" role="status" data-testid="doctor-banner">
-      <div className="doctor-banner-text">
-        <strong>{bad.title}:</strong> {bad.message}
-        {bad.fix && <div className="doctor-fix">{bad.fix}</div>}
-      </div>
-      <button className="btn small" onClick={onFix}>
-        Open Settings
-      </button>
-      <button className="icon-btn" aria-label="Dismiss" onClick={() => setDismissed(true)}>
-        ✕
-      </button>
+    <>
+      {parts.map((part, i) => {
+        if (part.length > 2 && part.startsWith('`') && part.endsWith('`')) return <code key={i}>{part.slice(1, -1)}</code>;
+        return part.split(ISO_RE).map((seg, j) =>
+          j % 2 === 1 ? (
+            <time key={`${i}-${j}`} dateTime={seg} title={seg}>
+              {relativeTime(seg, now)}
+            </time>
+          ) : (
+            <span key={`${i}-${j}`}>{seg}</span>
+          ),
+        );
+      })}
+    </>
+  );
+}
+
+/**
+ * Sidebar status item, directly above "Commands". The slot always reserves its height, so it appearing or
+ * disappearing never reflows anything, and it never overlaps the approval card. Opens Settings → Connection doctor.
+ */
+export function DoctorStatus({ doctor, onOpen }: { doctor: Doctor | null; onOpen: () => void }) {
+  const bad = firstProblem(doctor);
+  return (
+    <div className="doctor-slot">
+      {bad && (
+        <button
+          className="nav-item doctor-status"
+          data-testid="doctor-status"
+          title={`${bad.title}: ${bad.message}${bad.fix ? `\n${bad.fix}` : ''}`.replace(/`/g, '')}
+          onClick={onOpen}
+        >
+          <span aria-hidden>⚠</span>
+          <span className="doctor-status-text">
+            Connection: {bad.title}
+          </span>
+        </button>
+      )}
     </div>
   );
 }
@@ -95,16 +120,27 @@ export function DoctorPanel({
           Could not run the doctor: {error}
         </p>
       )}
+      {doctor?.checked_at && (
+        <div className="muted" data-testid="doctor-checked-at">
+          Checked <time dateTime={doctor.checked_at} title={doctor.checked_at}>{relativeTime(doctor.checked_at)}</time>
+        </div>
+      )}
       {doctor && (
         <ul className="doctor-list">
           {doctor.checks.map((c) => (
             <li key={c.id} data-testid={`doctor-check-${c.id}`} data-status={c.status}>
               <span className={`pill ${c.status}`}>{LABEL[c.status]}</span>
               <span className="doctor-title">{c.title}</span>
-              <div className="muted">{c.message}</div>
+              <div className="muted"><RichText text={c.message} /></div>
+              {c.detail && (
+                <details className="doctor-detail" data-testid={`doctor-detail-${c.id}`}>
+                  <summary>Details</summary>
+                  <pre>{c.detail}</pre>
+                </details>
+              )}
               {c.fix && c.status !== 'ok' && c.status !== 'skip' && (
                 <div className="doctor-fix" data-testid={`doctor-fix-${c.id}`}>
-                  {c.fix}
+                  <RichText text={c.fix} />
                 </div>
               )}
             </li>

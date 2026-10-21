@@ -12,18 +12,21 @@ declare global {
 }
 
 /** Calls a shell command if (and only if) running inside Tauri. Returns whether it was attempted. */
-export function shellInvoke(cmd: 'open_main' | 'hide_quick'): boolean {
+export function shellInvoke(cmd: 'open_main' | 'hide_quick', args: Record<string, unknown> = {}): boolean {
   const inv = typeof window !== 'undefined' ? window.__TAURI_INTERNALS__?.invoke : undefined;
   if (typeof inv !== 'function') return false;
   try {
-    void Promise.resolve(inv.call(window.__TAURI_INTERNALS__, cmd, {})).catch(() => undefined);
+    void Promise.resolve(inv.call(window.__TAURI_INTERNALS__, cmd, args)).catch(() => undefined);
     return true;
   } catch {
     return false;
   }
 }
 
-/** `workbench:open-main` */
-export const openMainWindow = () => shellInvoke('open_main');
+/**
+ * `workbench:open-main`. `focusApproval` must be true ONLY for the quick bar's "approvals waiting" link
+ * (an explicit user action); the shell then dispatches the explicit focus event in main.
+ */
+export const openMainWindow = (focusApproval: boolean) => shellInvoke('open_main', { focusApproval });
 /** `workbench:hide-quick` */
 export const hideQuickWindow = () => shellInvoke('hide_quick');

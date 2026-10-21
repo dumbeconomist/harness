@@ -613,6 +613,38 @@ fn track_tool(chips: &mut Vec<(String, String)>, tool: &str, status: &str) {
     chips.push((tool.to_string(), status.to_string()));
 }
 
+/// How long to keep reading Hermes after the client went away.
+const CLIENT_GONE_GRACE: Duration = Duration::from_secs(60);
+
+/// Save tool chips and the assistant text of a turn.
+fn persist_reply(
+    st: &SharedState,
+    tid: &str,
+    chips: &[(String, String)],
+    text: &str,
+    status: &str,
+) {
+    let saved = st.db.with(|c| {
+        for (tool, tstatus) in chips {
+            threads::add_message(
+                c,
+                tid,
+                "tool",
+                tool,
+                Some(&json!({"tool": tool, "status": tstatus})),
+            )?;
+        }
+        if !text.is_empty() {
+            threads::add_message_with(c, tid, "assistant", text, None, status)?;
+        }
+        Ok(())
+    });
+    if let Err(e) = saved {
+        // Thread deleted mid-stream, or a DB error: the answer was still streamed.
+        tracing::warn!("could not persist assistant message: {}", e.message);
+    }
+}
+
 async fn chat(
     State(st): State<SharedState>,
     ApiJson(body): ApiJson<ChatBody>,
@@ -629,6 +661,7 @@ async fn chat(
     let mut context = body.context.map(|c| (c.kind, c.id));
     let mut messages = body.messages;
     let mut session_id = body.session_id;
+    let mut user_msg_id: Option<String> = None;
 
     if let Some(tid) = &thread_id {
         // History comes from the DB; only the last user message of the body counts.
@@ -646,19 +679,20 @@ async fn chat(
                     context = Some((k, i));
                 }
             }
-            threads::add_message(c, tid, "user", &last_user.content, None)?;
+            let um = threads::add_message(c, tid, "user", &last_user.content, None)?;
+            user_msg_id = Some(um.id);
             threads::auto_title(c, tid, &last_user.content)?;
             threads::messages(c, tid)
         })?;
         messages = history
             .into_iter()
-            .filter(|m| m.role == "user" || m.role == "assistant")
+            .filter(|m| (m.role == "user" || m.role == "assistant") && m.status != "failed")
             .map(|m| ChatMessage {
                 role: m.role,
                 content: m.content,
             })
             .collect();
-        session_id = Some(tid.clone());
+        session_id = Some(format!("wb-{tid}"));
     }
 
     if let Some((kind, id)) = &context {
@@ -688,7 +722,20 @@ async fn chat(
     tokio::spawn(async move {
         let mut text = String::new();
         let mut chips: Vec<(String, String)> = Vec::new();
-        while let Some(ev) = upstream.next().await {
+        let mut gone = false; // the client disconnected
+        let mut gone_at = std::time::Instant::now();
+        let mut finished = false;
+        loop {
+            // After a disconnect keep draining for a while so usage is not lost.
+            let next = if gone {
+                let left = CLIENT_GONE_GRACE.saturating_sub(gone_at.elapsed());
+                tokio::time::timeout(left, upstream.next())
+                    .await
+                    .unwrap_or(None)
+            } else {
+                upstream.next().await
+            };
+            let Some(ev) = next else { break };
             let out = match ev {
                 BrainEvent::Delta(t) => {
                     text.push_str(&t);
@@ -699,41 +746,26 @@ async fn chat(
                     sse_json("tool", json!({"tool": tool, "status": status}))
                 }
                 BrainEvent::Error(message) => {
-                    let h = st.hermes();
-                    let shown = h
-                        .api_key
-                        .as_deref()
-                        .filter(|k| k.len() >= 4)
-                        .map_or(message.clone(), |k| message.replace(k, "***"));
-                    st.doctor
-                        .brain_error(&st.db, doctor::status_from_message(&shown), &shown);
-                    let _ = tx
-                        .send(sse_json("error", json!({"message": message})))
-                        .await;
+                    finished = true;
+                    let status = doctor::status_from_message(&message);
+                    let shown = doctor::record_brain_error(&st, status, &message);
+                    if let Some(id) = &user_msg_id {
+                        if let Err(e) = st.db.with(|c| threads::set_message_status(c, id, "failed"))
+                        {
+                            tracing::warn!("could not mark the turn failed: {}", e.message);
+                        }
+                    }
+                    if !gone {
+                        let _ = tx.send(sse_json("error", json!({"message": shown}))).await;
+                    }
                     break;
                 }
                 BrainEvent::Done { usage, model } => {
+                    finished = true;
                     st.doctor.brain_ok(&st.db);
                     if let Some(tid) = &thread_id {
-                        let saved = st.db.with(|c| {
-                            for (tool, status) in &chips {
-                                threads::add_message(
-                                    c,
-                                    tid,
-                                    "tool",
-                                    tool,
-                                    Some(&json!({"tool": tool, "status": status})),
-                                )?;
-                            }
-                            if !text.is_empty() {
-                                threads::add_message(c, tid, "assistant", &text, None)?;
-                            }
-                            Ok(())
-                        });
-                        if let Err(e) = saved {
-                            // Thread deleted mid-stream, or a DB error: the answer was still streamed.
-                            tracing::warn!("could not persist assistant message: {}", e.message);
-                        }
+                        let status = if gone { "partial" } else { "ok" };
+                        persist_reply(&st, tid, &chips, &text, status);
                     }
                     let rec = st.db.with(|c| {
                         ledger::record(
@@ -754,26 +786,35 @@ async fn chat(
                             0.0
                         }
                     };
-                    let _ = tx
-                        .send(sse_json(
-                            "done",
-                            json!({
-                                "usage": {
-                                    "prompt_tokens": usage.prompt_tokens,
-                                    "completion_tokens": usage.completion_tokens,
-                                    "total_tokens": usage.prompt_tokens + usage.completion_tokens,
-                                    "cost_usd": cost,
-                                },
-                                "model": model,
-                                "run_id": run_id,
-                            }),
-                        ))
-                        .await;
+                    if !gone {
+                        let _ = tx
+                            .send(sse_json(
+                                "done",
+                                json!({
+                                    "usage": {
+                                        "prompt_tokens": usage.prompt_tokens,
+                                        "completion_tokens": usage.completion_tokens,
+                                        "total_tokens": usage.prompt_tokens + usage.completion_tokens,
+                                        "cost_usd": cost,
+                                    },
+                                    "model": model,
+                                    "run_id": run_id,
+                                }),
+                            ))
+                            .await;
+                    }
                     break;
                 }
             };
-            if tx.send(out).await.is_err() {
-                break; // client went away
+            if !gone && tx.send(out).await.is_err() {
+                gone = true;
+                gone_at = std::time::Instant::now();
+            }
+        }
+        if !finished {
+            // Client left and the upstream never finished: keep what we have.
+            if let Some(tid) = &thread_id {
+                persist_reply(&st, tid, &chips, &text, "partial");
             }
         }
     });

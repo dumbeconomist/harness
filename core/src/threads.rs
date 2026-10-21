@@ -26,6 +26,8 @@ pub struct Message {
     pub role: String,
     pub content: String,
     pub tool_json: Option<Value>,
+    /// `ok`, `failed` (the turn errored) or `partial` (the reply was cut short).
+    pub status: String,
     pub created_at: String,
 }
 
@@ -51,6 +53,7 @@ fn message_row(r: &Row) -> rusqlite::Result<Message> {
         content: r.get(3)?,
         tool_json: tool.and_then(|s| serde_json::from_str(&s).ok()),
         created_at: r.get(5)?,
+        status: r.get(6)?,
     })
 }
 
@@ -98,7 +101,7 @@ pub fn get(conn: &Connection, id: &str) -> ApiResult<Option<Thread>> {
         .optional()?)
 }
 
-/// Newest (by creation) first; each filter applies only when given.
+/// Most recently active (`updated_at`) first; each filter applies only when given.
 pub fn list(
     conn: &Connection,
     context_kind: Option<&str>,
@@ -107,7 +110,7 @@ pub fn list(
     let mut st = conn.prepare(&format!(
         "SELECT {THREAD_COLS} FROM threads
          WHERE (?1 IS NULL OR context_kind = ?1) AND (?2 IS NULL OR context_id = ?2)
-         ORDER BY rowid DESC"
+         ORDER BY updated_at DESC, rowid DESC"
     ))?;
     let rows = st.query_map(params![context_kind, context_id], thread_row)?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -124,7 +127,7 @@ pub fn delete(conn: &Connection, id: &str) -> ApiResult<()> {
 /// Oldest first.
 pub fn messages(conn: &Connection, thread_id: &str) -> ApiResult<Vec<Message>> {
     let mut st = conn.prepare(
-        "SELECT id, thread_id, role, content, tool_json, created_at
+        "SELECT id, thread_id, role, content, tool_json, created_at, status
          FROM messages WHERE thread_id = ?1 ORDER BY rowid",
     )?;
     let rows = st.query_map(params![thread_id], message_row)?;
@@ -139,7 +142,19 @@ pub fn add_message(
     content: &str,
     tool_json: Option<&Value>,
 ) -> ApiResult<Message> {
+    add_message_with(conn, thread_id, role, content, tool_json, "ok")
+}
+
+pub fn add_message_with(
+    conn: &Connection,
+    thread_id: &str,
+    role: &str,
+    content: &str,
+    tool_json: Option<&Value>,
+    status: &str,
+) -> ApiResult<Message> {
     let m = Message {
+        status: status.to_string(),
         id: new_id(),
         thread_id: thread_id.to_string(),
         role: role.to_string(),
@@ -148,15 +163,16 @@ pub fn add_message(
         created_at: now(),
     };
     conn.execute(
-        "INSERT INTO messages(id, thread_id, role, content, tool_json, created_at)
-         VALUES (?1,?2,?3,?4,?5,?6)",
+        "INSERT INTO messages(id, thread_id, role, content, tool_json, created_at, status)
+         VALUES (?1,?2,?3,?4,?5,?6,?7)",
         params![
             m.id,
             m.thread_id,
             m.role,
             m.content,
             tool_json.map(|v| v.to_string()),
-            m.created_at
+            m.created_at,
+            m.status
         ],
     )?;
     conn.execute(
@@ -164,6 +180,14 @@ pub fn add_message(
         params![thread_id, m.created_at],
     )?;
     Ok(m)
+}
+
+pub fn set_message_status(conn: &Connection, id: &str, status: &str) -> ApiResult<()> {
+    conn.execute(
+        "UPDATE messages SET status = ?2 WHERE id = ?1",
+        params![id, status],
+    )?;
+    Ok(())
 }
 
 /// Give a still-untitled thread a title taken from its first user message.

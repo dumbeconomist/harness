@@ -37,7 +37,19 @@ pub struct Snapshot {
 
 pub struct Doctor {
     inner: Mutex<Snapshot>,
+    deep: Mutex<Option<DeepCache>>,
 }
+
+/// The last deep model check, kept in memory so the next plain poll still shows it.
+struct DeepCache {
+    at: std::time::Instant,
+    url: String,
+    key: Option<String>,
+    check: Check,
+}
+
+/// How long a deep result is still shown by non-deep runs.
+pub const DEEP_TTL: Duration = Duration::from_secs(600);
 
 fn clip(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
@@ -65,7 +77,24 @@ impl Doctor {
             .unwrap_or_default();
         Doctor {
             inner: Mutex::new(snap),
+            deep: Mutex::new(None),
         }
+    }
+
+    fn store_deep(&self, h: &HermesRuntime, check: Check) {
+        *self.deep.lock().unwrap_or_else(|e| e.into_inner()) = Some(DeepCache {
+            at: std::time::Instant::now(),
+            url: h.url.clone(),
+            key: h.api_key.clone(),
+            check,
+        });
+    }
+
+    /// The cached deep check if it is younger than `ttl` and Hermes settings are unchanged.
+    fn cached_deep(&self, h: &HermesRuntime, ttl: Duration) -> Option<Check> {
+        let g = self.deep.lock().unwrap_or_else(|e| e.into_inner());
+        let c = g.as_ref()?;
+        (c.at.elapsed() < ttl && c.url == h.url && c.key == h.api_key).then(|| c.check.clone())
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -130,13 +159,48 @@ fn redact(s: &str, secrets: &[&str]) -> String {
     out
 }
 
+/// Redact the Hermes key, UI token and MCP token.
+pub fn redact_secrets(st: &SharedState, s: &str) -> String {
+    let h = st.hermes();
+    let secrets: Vec<&str> = [
+        h.api_key.as_deref(),
+        Some(st.token.as_str()),
+        Some(st.mcp_token.as_str()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    redact(s, &secrets)
+}
+
+/// The single point where a brain error is recorded: secrets are removed
+/// before the message is stored. Returns the redacted message for callers
+/// that show it (SSE, doctor).
+pub fn record_brain_error(st: &SharedState, status: Option<u16>, message: &str) -> String {
+    let msg = redact_secrets(st, message);
+    st.doctor.brain_error(&st.db, status, &msg);
+    msg
+}
+
+/// Friendly text for a transport failure, plus the raw error as detail.
+fn friendly_transport(e: reqwest::Error, url: &str) -> (String, String) {
+    let timeout = e.is_timeout();
+    let detail = e.without_url().to_string();
+    let msg = if timeout {
+        format!("Hermes at {url} didn't answer in time. Is the gateway running?")
+    } else {
+        format!("Can't reach Hermes at {url}. Is the gateway running?")
+    };
+    (msg, detail)
+}
+
 /// `GET {HERMES_URL}/models`; records the outcome as brain ok/error. Any HTTP
-/// answer is `Ok(status)`; only a transport failure is `Err`.
+/// answer is `Ok(status)`; only a transport failure is `Err((friendly, raw))`.
 pub async fn probe_models(
     st: &SharedState,
     h: &HermesRuntime,
     timeout: Duration,
-) -> Result<u16, String> {
+) -> Result<u16, (String, String)> {
     let url = format!("{}/models", h.url.trim_end_matches('/'));
     let mut rb = st.http.get(url).timeout(timeout);
     if let Some(k) = &h.api_key {
@@ -148,22 +212,21 @@ pub async fn probe_models(
             if r.status().is_success() {
                 st.doctor.brain_ok(&st.db);
             } else {
-                st.doctor
-                    .brain_error(&st.db, Some(code), &format!("HTTP {code} from /models"));
+                record_brain_error(st, Some(code), &format!("HTTP {code} from /models"));
             }
             Ok(code)
         }
         Err(e) => {
-            let msg = e.without_url().to_string();
-            st.doctor.brain_error(&st.db, None, &msg);
-            Err(msg)
+            let (friendly, detail) = friendly_transport(e, &h.url);
+            record_brain_error(st, None, &detail);
+            Err((friendly, detail))
         }
     }
 }
 
 // ------------------------------------------------------------------ report
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Check {
     pub id: &'static str,
     pub title: &'static str,
@@ -171,6 +234,12 @@ pub struct Check {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fix: Option<String>,
+    /// Raw technical error, for the curious.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// Set on a deep result replayed from the cache.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checked_at: Option<String>,
     pub blocking: bool,
 }
 
@@ -185,8 +254,16 @@ struct Builder {
     blocked: bool,
 }
 
+const T_API: &str = "Hermes API";
+const T_KEY: &str = "API key";
+const T_MODEL: &str = "Model";
+const T_CONN: &str = "Connection to Workbench";
+const T_TOOLS: &str = "Workbench tools";
+const T_LOCK: &str = "Profile lock";
+
 impl Builder {
-    fn push(
+    #[allow(clippy::too_many_arguments)]
+    fn add(
         &mut self,
         id: &'static str,
         title: &'static str,
@@ -194,6 +271,7 @@ impl Builder {
         status: &'static str,
         message: impl Into<String>,
         fix: Option<&str>,
+        detail: Option<String>,
     ) {
         if status == "fail" && blocking {
             self.blocked = true;
@@ -204,19 +282,35 @@ impl Builder {
             status,
             message: message.into(),
             fix: fix.map(String::from),
+            detail,
+            checked_at: None,
             blocking,
         });
     }
 
+    fn push(
+        &mut self,
+        id: &'static str,
+        title: &'static str,
+        blocking: bool,
+        status: &'static str,
+        message: impl Into<String>,
+        fix: Option<&str>,
+    ) {
+        self.add(id, title, blocking, status, message, fix, None);
+    }
+
+    fn skip_with(&mut self, id: &'static str, title: &'static str, blocking: bool, message: &str) {
+        self.push(id, title, blocking, "skip", message, None);
+    }
+
     fn skip(&mut self, id: &'static str, title: &'static str, blocking: bool) {
-        self.checks.push(Check {
+        self.skip_with(
             id,
             title,
-            status: "skip",
-            message: "Skipped until the earlier problem is fixed.".into(),
-            fix: None,
             blocking,
-        });
+            "Skipped until the earlier problem is fixed.",
+        );
     }
 }
 
@@ -279,7 +373,11 @@ fn dangerous_enabled(entries: &[(String, bool)]) -> Vec<String> {
         .collect()
 }
 
-async fn check_deep_model(st: &SharedState, h: &HermesRuntime) -> Result<(), String> {
+/// Ok, or `(message, detail)` for a failed deep check.
+async fn check_deep_model(
+    st: &SharedState,
+    h: &HermesRuntime,
+) -> Result<(), (String, Option<String>)> {
     let url = format!("{}/chat/completions", h.url.trim_end_matches('/'));
     let mut rb = st.http.post(url).timeout(MODEL_TIMEOUT).json(&json!({
         "model": st.hermes_model.clone().unwrap_or_else(|| DEFAULT_MODEL.to_string()),
@@ -291,9 +389,9 @@ async fn check_deep_model(st: &SharedState, h: &HermesRuntime) -> Result<(), Str
         rb = rb.bearer_auth(k);
     }
     let resp = rb.send().await.map_err(|e| {
-        let m = e.without_url().to_string();
-        st.doctor.brain_error(&st.db, None, &m);
-        format!("the test request failed: {m}")
+        let (friendly, detail) = friendly_transport(e, &h.url);
+        record_brain_error(st, None, &detail);
+        (friendly, Some(detail))
     })?;
     let code = resp.status().as_u16();
     if resp.status().is_success() {
@@ -310,10 +408,10 @@ async fn check_deep_model(st: &SharedState, h: &HermesRuntime) -> Result<(), Str
                 .map(String::from)
         })
         .unwrap_or_else(|| clip(&text, 300));
-    st.doctor.brain_error(&st.db, Some(code), &upstream);
-    Err(format!(
-        "Hermes answered HTTP {code}: {}",
-        clip(&upstream, 300)
+    let upstream = record_brain_error(st, Some(code), &clip(&upstream, 300));
+    Err((
+        format!("Hermes answered HTTP {code}: {upstream}"),
+        Some(upstream),
     ))
 }
 
@@ -328,17 +426,26 @@ pub async fn run(st: &SharedState, deep: bool) -> Report {
     // hermes_reachable + hermes_auth share one request.
     let probe = probe_models(st, &h, PROBE_TIMEOUT).await;
     match &probe {
-        Err(e) => b.push(
+        Err((friendly, detail)) => b.add(
             "hermes_reachable",
-            "Hermes is running",
+            T_API,
             true,
             "fail",
-            format!("Can't reach Hermes at {}: {e}", h.url),
+            friendly.clone(),
             Some(FIX_START),
+            Some(detail.clone()),
+        ),
+        Ok(code) if *code >= 500 => b.push(
+            "hermes_reachable",
+            T_API,
+            true,
+            "warn",
+            format!("Hermes answered with an error (HTTP {code})"),
+            None,
         ),
         Ok(code) => b.push(
             "hermes_reachable",
-            "Hermes is running",
+            T_API,
             true,
             "ok",
             format!("Hermes answered at {} (HTTP {code})", h.url),
@@ -346,12 +453,12 @@ pub async fn run(st: &SharedState, deep: bool) -> Report {
         ),
     }
     if b.blocked {
-        b.skip("hermes_auth", "Hermes accepts our key", true);
+        b.skip("hermes_auth", T_KEY, true);
     } else {
         match probe {
             Ok(401) | Ok(403) => b.push(
                 "hermes_auth",
-                "Hermes accepts our key",
+                T_KEY,
                 true,
                 "fail",
                 format!(
@@ -364,17 +471,15 @@ pub async fn run(st: &SharedState, deep: bool) -> Report {
                 ),
                 Some(FIX_KEY),
             ),
-            Ok(code) if code >= 500 => b.push(
+            Ok(code) if code >= 500 => b.skip_with(
                 "hermes_auth",
-                "Hermes accepts our key",
+                T_KEY,
                 true,
-                "warn",
-                format!("Hermes answered HTTP {code}; can't tell if the key is accepted"),
-                None,
+                "Can't tell while Hermes is erroring",
             ),
             _ => b.push(
                 "hermes_auth",
-                "Hermes accepts our key",
+                T_KEY,
                 true,
                 "ok",
                 "The API key is accepted",
@@ -383,43 +488,53 @@ pub async fn run(st: &SharedState, deep: bool) -> Report {
         }
     }
 
-    // hermes_model (deep only)
+    // hermes_model: deep runs it; plain runs replay a recent deep result.
     if b.blocked {
-        b.skip("hermes_model", "Model responds", true);
-    } else if !deep {
-        b.checks.push(Check {
-            id: "hermes_model",
-            title: "Model responds",
-            status: "skip",
-            message: "Not tested. Run the deep check to send a 1-token request.".into(),
-            fix: None,
-            blocking: true,
-        });
-    } else {
+        b.skip("hermes_model", T_MODEL, true);
+    } else if deep {
+        let id = "hermes_model";
         match check_deep_model(st, &h).await {
             Ok(()) => b.push(
-                "hermes_model",
-                "Model responds",
+                id,
+                T_MODEL,
                 true,
                 "ok",
                 "The model answered a 1-token test request",
                 None,
             ),
-            Err(e) => b.push(
-                "hermes_model",
-                "Model responds",
+            Err((msg, detail)) => b.add(
+                id,
+                T_MODEL,
                 true,
                 "fail",
-                e,
+                msg,
                 Some("Check the model and provider configured in the Workbench Hermes profile"),
+                detail,
             ),
         }
+        let last = b.checks.last_mut().expect("just pushed");
+        last.checked_at = Some(now());
+        st.doctor.store_deep(&h, last.clone());
+    } else if let Some(mut c) = st.doctor.cached_deep(&h, DEEP_TTL) {
+        // Cached message was redacted when built; the final pass redacts again.
+        if c.status == "fail" {
+            b.blocked = true;
+        }
+        c.message = format!("{} (deep check)", c.message);
+        b.checks.push(c);
+    } else {
+        b.skip_with(
+            "hermes_model",
+            T_MODEL,
+            true,
+            "Not tested. Run the deep check to send a 1-token request.",
+        );
     }
 
     // mcp_connected / mcp_tools_seen
     if b.blocked {
-        b.skip("mcp_connected", "Hermes has connected to Workbench", false);
-        b.skip("mcp_tools_seen", "Hermes has listed Workbench tools", false);
+        b.skip("mcp_connected", T_CONN, false);
+        b.skip("mcp_tools_seen", T_TOOLS, false);
     } else {
         match &snap.mcp_last_initialize_at {
             Some(at) => {
@@ -431,81 +546,102 @@ pub async fn run(st: &SharedState, deep: bool) -> Report {
                     .unwrap_or_default();
                 b.push(
                     "mcp_connected",
-                    "Hermes has connected to Workbench",
+                    T_CONN,
                     false,
                     "ok",
                     format!("Hermes connected{who}; last seen {at}"),
                     None,
                 );
+                match &snap.mcp_last_tools_list_at {
+                    Some(at) => b.push(
+                        "mcp_tools_seen",
+                        T_TOOLS,
+                        false,
+                        "ok",
+                        format!("Hermes listed Workbench's tools; last seen {at}"),
+                        None,
+                    ),
+                    None => b.push(
+                        "mcp_tools_seen",
+                        T_TOOLS,
+                        false,
+                        "warn",
+                        "Hermes connected but never listed tools",
+                        Some(FIX_TOOLS),
+                    ),
+                }
             }
-            None => b.push(
-                "mcp_connected",
-                "Hermes has connected to Workbench",
-                false,
-                "warn",
-                "Hermes hasn't connected to Workbench yet",
-                Some(FIX_MCP),
-            ),
-        }
-        match &snap.mcp_last_tools_list_at {
-            Some(at) => b.push(
-                "mcp_tools_seen",
-                "Hermes has listed Workbench tools",
-                false,
-                "ok",
-                format!("Hermes listed Workbench's tools; last seen {at}"),
-                None,
-            ),
-            None => b.push(
-                "mcp_tools_seen",
-                "Hermes has listed Workbench tools",
-                false,
-                "warn",
-                "Hermes connected but never listed tools",
-                Some(FIX_TOOLS),
-            ),
+            None => {
+                b.push(
+                    "mcp_connected",
+                    T_CONN,
+                    false,
+                    "warn",
+                    "Hermes hasn't connected to Workbench yet",
+                    Some(FIX_MCP),
+                );
+                b.skip_with(
+                    "mcp_tools_seen",
+                    T_TOOLS,
+                    false,
+                    "Waiting for Hermes to connect",
+                );
+            }
         }
     }
 
     // profile_locked
     if b.blocked {
-        b.skip("profile_locked", "Hermes profile is locked down", true);
+        b.skip("profile_locked", T_LOCK, true);
     } else {
         let url = format!("{}/toolsets", h.url.trim_end_matches('/'));
         let mut rb = st.http.get(url).timeout(PROBE_TIMEOUT);
         if let Some(k) = &h.api_key {
             rb = rb.bearer_auth(k);
         }
-        let title = "Hermes profile is locked down";
+        let id = "profile_locked";
         match rb.send().await {
-            Err(e) => b.push(
-                "profile_locked",
-                title,
-                true,
-                "warn",
-                format!("Can't verify the profile: {}", e.without_url()),
-                None,
-            ),
+            Err(e) => {
+                let (_, detail) = friendly_transport(e, &h.url);
+                b.add(
+                    id,
+                    T_LOCK,
+                    true,
+                    "warn",
+                    "Can't verify the profile: Hermes didn't answer",
+                    None,
+                    Some(detail),
+                );
+            }
             Ok(r) if r.status().as_u16() == 404 => b.push(
-                "profile_locked",
-                title,
+                id,
+                T_LOCK,
                 true,
                 "warn",
                 "This Hermes has no /toolsets endpoint, so Workbench can't verify the profile is locked",
                 Some(FIX_LOCKED),
             ),
             Ok(r) if !r.status().is_success() => b.push(
-                "profile_locked",
-                title,
+                id,
+                T_LOCK,
                 true,
                 "warn",
-                format!("Can't verify the profile: /toolsets answered HTTP {}", r.status().as_u16()),
+                format!(
+                    "Can't verify the profile: /toolsets answered HTTP {}",
+                    r.status().as_u16()
+                ),
                 None,
             ),
-            Ok(r) => match r.json::<Value>().await.ok().as_ref().and_then(toolset_entries) {
+            Ok(r) => match r
+                .json::<Value>()
+                .await
+                .ok()
+                .as_ref()
+                .and_then(toolset_entries)
+            {
                 None => b.push(
-                    "profile_locked",
-                    title,
+                    id,
+                    T_LOCK,
                     true,
                     "warn",
                     "Can't verify the profile: unrecognised /toolsets response",
@@ -515,8 +651,8 @@ pub async fn run(st: &SharedState, deep: bool) -> Report {
                     let bad = dangerous_enabled(&entries);
                     if bad.is_empty() {
                         b.push(
-                            "profile_locked",
-                            title,
+                            id,
+                            T_LOCK,
                             true,
                             "ok",
                             "Hermes' own terminal and file tools are off",
@@ -524,8 +660,8 @@ pub async fn run(st: &SharedState, deep: bool) -> Report {
                         );
                     } else {
                         b.push(
-                            "profile_locked",
-                            title,
+                            id,
+                            T_LOCK,
                             true,
                             "fail",
                             format!(
@@ -541,17 +677,10 @@ pub async fn run(st: &SharedState, deep: bool) -> Report {
     }
 
     // Never leak secrets, whatever the upstream echoed back.
-    let secrets: Vec<&str> = [
-        h.api_key.as_deref(),
-        Some(st.token.as_str()),
-        Some(st.mcp_token.as_str()),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
     for c in &mut b.checks {
-        c.message = redact(&c.message, &secrets);
-        c.fix = c.fix.as_deref().map(|f| redact(f, &secrets));
+        c.message = redact_secrets(st, &c.message);
+        c.fix = c.fix.as_deref().map(|f| redact_secrets(st, f));
+        c.detail = c.detail.as_deref().map(|f| redact_secrets(st, f));
     }
     let ok = !b.checks.iter().any(|c| c.blocking && c.status == "fail");
     Report {
@@ -590,6 +719,35 @@ mod tests {
         );
         assert_eq!(status_from_message("Hermes is unreachable"), None);
         assert_eq!(redact("key=abcd1234!", &["abcd1234"]), "key=***!");
+    }
+
+    #[test]
+    fn deep_cache_expires_and_tracks_settings() {
+        let db = Db::open_memory().unwrap();
+        let d = Doctor::load(&db);
+        let h = HermesRuntime {
+            url: "http://a/v1".into(),
+            api_key: Some("k".into()),
+        };
+        let c = Check {
+            id: "hermes_model",
+            title: T_MODEL,
+            status: "ok",
+            message: "m".into(),
+            fix: None,
+            detail: None,
+            checked_at: Some(now()),
+            blocking: true,
+        };
+        assert!(d.cached_deep(&h, DEEP_TTL).is_none());
+        d.store_deep(&h, c);
+        assert!(d.cached_deep(&h, DEEP_TTL).is_some());
+        assert!(d.cached_deep(&h, Duration::ZERO).is_none());
+        let other = HermesRuntime {
+            url: "http://b/v1".into(),
+            ..h.clone()
+        };
+        assert!(d.cached_deep(&other, DEEP_TTL).is_none());
     }
 
     #[test]

@@ -1,13 +1,16 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { ApprovalCard } from '../approvals/ApprovalCard';
+import { requestFocusApproval } from '../../lib/focusApproval';
 import { UndoResult } from '../palette/CommandResult';
-import { DoctorBanner, DoctorPanel, firstProblem } from '../doctor/Doctor';
+import { DoctorPanel, DoctorStatus, RichText, firstProblem } from '../doctor/Doctor';
 import { ChatPane, threadToMsgs } from '../chat/ChatPane';
 import { DayBars, LedgerView, fillDays } from '../ledger/LedgerView';
 import { QuickBar } from '../quick/QuickBar';
-import { createApprovalAlerts, TYPING_GRACE_MS } from '../../lib/alerts';
-import type { Api } from '../../lib/api';
+import { createApprovalAlerts } from '../../lib/alerts';
+import { ApiError, type Api } from '../../lib/api';
+import { hideQuickWindow, openMainWindow } from '../../lib/native';
 import type { CommandCtx } from '../../lib/commands';
 import type { Approval, Doctor, JournalEntry, Thread, ThreadMessage } from '../../lib/types';
 
@@ -52,6 +55,19 @@ describe('/undo arm', () => {
     expect(api.undo).toHaveBeenCalledTimes(1);
     expect(api.undo).toHaveBeenCalledWith('j1');
     expect(screen.getByTestId('undo-done')).toBeInTheDocument();
+  });
+
+  it('409 stale: hides Confirm, friendly text, no raw id, link to Activity', async () => {
+    const { ctx } = mkCtx({ undo: vi.fn().mockRejectedValue(new ApiError('entry 01JABCDEF is stale; undo 01JXYZ first', 409, 'stale')) });
+    render(<UndoResult entry={entry} ctx={ctx} />);
+    act(() => void vi.advanceTimersByTime(700));
+    fireEvent.click(screen.getByTestId('undo-confirm-cmd'));
+    await act(async () => void (await vi.advanceTimersByTimeAsync(0)));
+    expect(screen.getByTestId('undo-stale')).toHaveTextContent('undo the newer change first');
+    expect(screen.getByTestId('undo-stale').textContent).not.toMatch(/01J/);
+    expect(screen.queryByTestId('undo-confirm-cmd')).toBeNull();
+    fireEvent.click(screen.getByText('Open Activity'));
+    expect(ctx.ui).toHaveBeenCalledWith({ type: 'goto', view: 'journal' });
   });
 
   it('a different entry re-arms', () => {
@@ -99,24 +115,45 @@ describe('Connection doctor', () => {
     expect(api.doctor).toHaveBeenLastCalledWith(true);
   });
 
+  it('shows collapsed Details and the checked-at time', async () => {
+    const d = doctor();
+    d.checks[0]!.detail = 'error sending request for url';
+    d.checked_at = new Date(Date.now() - 120_000).toISOString();
+    render(<DoctorPanel api={{ doctor: vi.fn().mockResolvedValue(d) }} />);
+    const det = await screen.findByTestId('doctor-detail-hermes_reachable');
+    expect(det).not.toHaveAttribute('open');
+    expect(det).toHaveTextContent('error sending request');
+    expect(screen.getByTestId('doctor-checked-at')).toHaveTextContent('2 min ago');
+  });
+
   it('shows an error if the doctor endpoint is unavailable', async () => {
     render(<DoctorPanel api={{ doctor: vi.fn().mockRejectedValue(new Error('HTTP 404')) }} />);
     expect(await screen.findByTestId('doctor-error')).toHaveTextContent('HTTP 404');
   });
 
-  it('banner: first failing check + fix, dismissable, absent when ok', async () => {
+  it('sidebar status: first failing check, stable slot, opens Settings; absent when ok or warn-only', async () => {
     const d = doctor();
     expect(firstProblem(d)?.id).toBe('hermes_reachable');
-    const { rerender } = render(<DoctorBanner doctor={d} onFix={vi.fn()} />);
-    expect(screen.getByTestId('doctor-banner')).toHaveTextContent('Connection refused');
-    expect(screen.getByTestId('doctor-banner')).toHaveTextContent('hermes -p workbench gateway run');
-    await userEvent.click(screen.getByLabelText('Dismiss'));
-    expect(screen.queryByTestId('doctor-banner')).toBeNull();
-    rerender(<DoctorBanner doctor={{ ok: true, checks: [] }} onFix={vi.fn()} />);
-    rerender(<DoctorBanner doctor={d} onFix={vi.fn()} />);
-    expect(screen.getByTestId('doctor-banner')).toBeInTheDocument(); // healthy -> failing again shows afresh
-    rerender(<DoctorBanner doctor={{ ok: true, checks: d.checks }} onFix={vi.fn()} />);
-    expect(screen.queryByTestId('doctor-banner')).toBeNull(); // warn-only is ok:true -> no banner
+    const onOpen = vi.fn();
+    const { container, rerender } = render(<DoctorStatus doctor={d} onOpen={onOpen} />);
+    expect(container.querySelector('.doctor-slot')).toBeInTheDocument();
+    const item = screen.getByTestId('doctor-status');
+    expect(item).toHaveTextContent('Connection: Hermes reachable');
+    expect(item.getAttribute('title')).toContain('Connection refused');
+    await userEvent.click(item);
+    expect(onOpen).toHaveBeenCalled();
+    rerender(<DoctorStatus doctor={{ ok: true, checks: d.checks }} onOpen={onOpen} />);
+    expect(screen.queryByTestId('doctor-status')).toBeNull();
+    expect(container.querySelector('.doctor-slot')).toBeInTheDocument(); // slot stays: no reflow
+  });
+
+  it('renders backticks as code and ISO times as relative with an ISO tooltip', () => {
+    const now = Date.parse('2026-10-21T12:00:00Z');
+    const { container } = render(<RichText now={now} text="Run `hermes gateway run`; last seen 2026-10-21T11:58:00Z." />);
+    expect(container.querySelector('code')).toHaveTextContent('hermes gateway run');
+    const t = container.querySelector('time')!;
+    expect(t).toHaveTextContent('2 min ago');
+    expect(t).toHaveAttribute('title', '2026-10-21T11:58:00Z');
   });
 });
 
@@ -186,6 +223,26 @@ describe('thread switcher', () => {
     vi.unstubAllGlobals();
   });
 
+  it('failed user turns offer retry (re-sent as a new turn); partial replies are marked interrupted', async () => {
+    const api = mkApi();
+    api.threadMessages.mockResolvedValue([
+      { id: '1', thread_id: 'th2', role: 'user', content: 'lost one', tool_json: null, status: 'failed', created_at: '' },
+      { id: '2', thread_id: 'th2', role: 'user', content: 'cut', tool_json: null, status: 'ok', created_at: '' },
+      { id: '3', thread_id: 'th2', role: 'assistant', content: 'half an ans', tool_json: null, status: 'partial', created_at: '' },
+    ]);
+    const fetchMock = vi.fn().mockResolvedValue(new Response('event: delta\ndata: {"text":"ok"}\n\nevent: done\ndata: {}\n\n', { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    render(pane(api));
+    expect(await screen.findByTestId('interrupted')).toHaveTextContent('(interrupted)');
+    await userEvent.click(screen.getByRole('button', { name: 'retry' }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    const body = JSON.parse((fetchMock.mock.calls[0]![1] as RequestInit).body as string);
+    expect(body.messages).toEqual([{ role: 'user', content: 'lost one' }]);
+    expect(body.thread_id).toBe('th2');
+    await screen.findByText('ok');
+    vi.unstubAllGlobals();
+  });
+
   it('maps tool rows to chips on the assistant reply', () => {
     const msgs = threadToMsgs([
       { id: '1', thread_id: 't', role: 'user', content: 'add a task', tool_json: null, created_at: '' },
@@ -237,11 +294,20 @@ describe('QuickBar', () => {
     undo: vi.fn(),
     doctor: vi.fn(),
     decide: vi.fn(),
+    createThread: vi.fn().mockResolvedValue({ id: 'thG' }),
   });
+  const fetchMock = vi.fn().mockImplementation(async () => new Response('event: delta\ndata: {"text":"Forty-two"}\n\nevent: done\ndata: {}\n\n', { status: 200 }));
+  beforeEach(() => {
+    localStorage.clear();
+    fetchMock.mockClear();
+    delete window.__TAURI_INTERNALS__;
+  });
+  const settled = async () => void (await screen.findByTestId('quick-approvals-link'));
 
   it('shows the approvals-waiting link; Enter spam in the input never decides and creates one task', async () => {
     const api = mkApi();
     render(<QuickBar api={api as unknown as Api} />);
+    await settled();
     expect(await screen.findByTestId('quick-approvals-link')).toHaveTextContent('2 approvals waiting');
     const input = screen.getByLabelText('Quick command');
     expect(input).toHaveFocus();
@@ -257,6 +323,7 @@ describe('QuickBar', () => {
   it('Enter on an empty input is inert; arrow-selecting a suggestion then Enter completes it', async () => {
     const api = mkApi();
     render(<QuickBar api={api as unknown as Api} />);
+    await settled();
     const input = screen.getByLabelText('Quick command');
     fireEvent.keyDown(input, { key: 'Enter' });
     fireEvent.keyDown(input, { key: 'Enter' });
@@ -271,6 +338,7 @@ describe('QuickBar', () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     const api = mkApi();
     render(<QuickBar api={api as unknown as Api} />);
+    await settled();
     const input = screen.getByLabelText('Quick command');
     fireEvent.change(input, { target: { value: '/undo' } });
     fireEvent.keyDown(input, { key: 'Enter' });
@@ -286,20 +354,93 @@ describe('QuickBar', () => {
 
   it('free text streams an /ask answer and offers Open in Workbench', async () => {
     const api = mkApi();
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('event: delta\ndata: {"text":"Forty-two"}\n\nevent: done\ndata: {}\n\n', { status: 200 })));
+    vi.stubGlobal('fetch', fetchMock);
     render(<QuickBar api={api as unknown as Api} />);
+    await settled();
     const input = screen.getByLabelText('Quick command');
+    fetchMock.mockClear();
     await userEvent.type(input, 'meaning of life{Enter}');
     expect(await screen.findByTestId('ask-answer')).toHaveTextContent('Forty-two');
-    expect(screen.getByTestId('open-in-workbench')).toBeInTheDocument();
+    expect(await screen.findByTestId('open-in-workbench')).toBeInTheDocument();
     expect(api.createTask).not.toHaveBeenCalled();
+    expect(api.createThread).toHaveBeenCalledWith({ context_kind: 'general', context_id: 'general', title: 'meaning of life' });
+    const body = JSON.parse((fetchMock.mock.calls[0]![1] as RequestInit).body as string);
+    expect(body.thread_id).toBe('thG');
     vi.unstubAllGlobals();
+  });
+
+  it('Open in Workbench hands over THAT thread (no re-send); focusApproval is false', async () => {
+    const invoke = vi.fn().mockResolvedValue(undefined);
+    window.__TAURI_INTERNALS__ = { invoke };
+    vi.stubGlobal('fetch', fetchMock);
+    const api = mkApi();
+    render(<QuickBar api={api as unknown as Api} />);
+    await settled();
+    await userEvent.type(screen.getByLabelText('Quick command'), 'hello{Enter}');
+    await userEvent.click(await screen.findByTestId('open-in-workbench'));
+    expect(invoke).toHaveBeenCalledWith('open_main', { focusApproval: false });
+    expect(JSON.parse(localStorage.getItem('workbench.handoff')!).action).toEqual({ type: 'open-thread', id: 'thG' });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    localStorage.clear();
+    delete window.__TAURI_INTERNALS__;
+    vi.unstubAllGlobals();
+  });
+
+  it('native open_main argument: true only for the approvals link; false for /goto', async () => {
+    const invoke = vi.fn().mockResolvedValue(undefined);
+    window.__TAURI_INTERNALS__ = { invoke };
+    render(<QuickBar api={mkApi() as unknown as Api} />);
+    await userEvent.click(await screen.findByTestId('quick-approvals-link'));
+    expect(invoke).toHaveBeenLastCalledWith('open_main', { focusApproval: true });
+    expect(localStorage.getItem('workbench.handoff')).toBeNull(); // the shell dispatches the focus event itself
+    await userEvent.type(screen.getByLabelText('Quick command'), '/goto ledger{Enter}');
+    expect(invoke).toHaveBeenLastCalledWith('open_main', { focusApproval: false });
+    delete window.__TAURI_INTERNALS__;
+    localStorage.clear();
+  });
+
+  it('typing clears a stale result; hiding the window resets everything', async () => {
+    const api = mkApi();
+    render(<QuickBar api={api as unknown as Api} />);
+    await settled();
+    const input = screen.getByLabelText('Quick command');
+    await userEvent.type(input, '/task milk{Enter}');
+    expect(await screen.findByTestId('cmd-done')).toBeInTheDocument();
+    await userEvent.type(input, 'x');
+    expect(screen.queryByTestId('cmd-done')).toBeNull();
+    await userEvent.clear(input);
+    await userEvent.type(input, '/task two{Enter}');
+    expect(await screen.findByTestId('cmd-done')).toBeInTheDocument();
+    await userEvent.type(input, 'abc');
+    act(() => void window.dispatchEvent(new Event('workbench:quick-hidden')));
+    expect(input).toHaveValue('');
+    expect(screen.queryByTestId('cmd-done')).toBeNull();
+    await userEvent.type(input, '/task three{Enter}');
+    expect(await screen.findByTestId('cmd-done')).toBeInTheDocument();
+    act(() => void window.dispatchEvent(new Event('blur')));
+    expect(screen.queryByTestId('cmd-done')).toBeNull();
+  });
+
+  it('shell helpers pass the argument shape', () => {
+    const invoke = vi.fn().mockResolvedValue(undefined);
+    window.__TAURI_INTERNALS__ = { invoke };
+    openMainWindow(true);
+    openMainWindow(false);
+    hideQuickWindow();
+    expect(invoke.mock.calls).toEqual([
+      ['open_main', { focusApproval: true }],
+      ['open_main', { focusApproval: false }],
+      ['hide_quick', {}],
+    ]);
+    delete window.__TAURI_INTERNALS__;
+    expect(openMainWindow(false)).toBe(false);
   });
 
   it('Esc calls the shell hide command when present, and only then', async () => {
     const invoke = vi.fn().mockResolvedValue(undefined);
     window.__TAURI_INTERNALS__ = { invoke };
     render(<QuickBar api={mkApi() as unknown as Api} />);
+    await settled();
     await userEvent.type(screen.getByLabelText('Quick command'), 'hello{Escape}');
     expect(invoke).toHaveBeenCalledWith('hide_quick', {});
     expect(screen.getByLabelText('Quick command')).toHaveValue('');
@@ -325,15 +466,17 @@ describe('approval alerts', () => {
     let t = 1_000_000;
     const native = { notify: vi.fn(), setBadge: vi.fn() };
     const focusApproval = vi.fn();
+    const highlight = vi.fn();
     const browserNotify = vi.fn();
     const alerts = createApprovalAlerts({
       now: () => t,
       isBackground: () => background,
       native: () => (nativePresent ? native : undefined),
       browserNotify,
+      highlight,
       focusApproval,
     });
-    return { alerts, native, focusApproval, browserNotify, advance: (ms: number) => (t += ms) };
+    return { alerts, native, focusApproval, highlight, browserNotify, advance: (ms: number) => (t += ms) };
   }
 
   it('notifies once per new approval when backgrounded, with no actions, and sets the badge', () => {
@@ -363,45 +506,67 @@ describe('approval alerts', () => {
     expect(focusApproval).toHaveBeenCalledTimes(1);
   });
 
-  it('focuses the card once when the window activates within 2 minutes and the approval is still pending', () => {
-    const { alerts, focusApproval, advance } = setup();
+  it('on activation within 2 minutes it only pulses (once) and never moves focus', () => {
+    const { alerts, focusApproval, highlight, advance } = setup();
     alerts.sync([ap('a')]);
     advance(30_000);
     alerts.onActivate();
     alerts.onActivate();
-    expect(focusApproval).toHaveBeenCalledTimes(1);
+    expect(highlight).toHaveBeenCalledTimes(1);
+    expect(focusApproval).not.toHaveBeenCalled();
   });
 
-  it('does not focus after 2 minutes, after the approval is handled, or without a notification', () => {
+  it('does not pulse after 2 minutes, after the approval is handled, or without a notification', () => {
     const late = setup();
     late.alerts.sync([ap('a')]);
     late.advance(121_000);
     late.alerts.onActivate();
-    expect(late.focusApproval).not.toHaveBeenCalled();
+    expect(late.highlight).not.toHaveBeenCalled();
 
     const handled = setup();
     handled.alerts.sync([ap('a')]);
     handled.alerts.sync([]);
     handled.alerts.onActivate();
-    expect(handled.focusApproval).not.toHaveBeenCalled();
+    expect(handled.highlight).not.toHaveBeenCalled();
     expect(handled.alerts._notifiedCount()).toBe(0);
 
     const none = setup(false);
     none.alerts.sync([ap('a')]);
     none.alerts.onActivate();
-    expect(none.focusApproval).not.toHaveBeenCalled();
+    expect(none.highlight).not.toHaveBeenCalled();
+    for (const x of [late, handled, none]) expect(x.focusApproval).not.toHaveBeenCalled();
   });
+});
 
-  it('does not steal focus if the user typed in an input within the last second', () => {
-    const { alerts, focusApproval, advance } = setup();
-    alerts.sync([ap('a')]);
-    advance(5000);
-    alerts.noteTyping();
-    advance(TYPING_GRACE_MS - 100);
-    alerts.onActivate();
-    expect(focusApproval).not.toHaveBeenCalled();
-    advance(200); // typing was >1s ago, marker kept: a later activation may focus
-    alerts.onActivate();
-    expect(focusApproval).toHaveBeenCalledTimes(1);
+describe('focus-approval event is explicit-only (P0 guard)', () => {
+  const card = () => {
+    const onDecide = vi.fn().mockResolvedValue(undefined);
+    render(<ApprovalCard approval={{ id: 'a', tool: 'tasks_create', tier: 1, args_json: '{}', summary: 's', status: 'pending', requested_by: 'h', created_at: '', decided_at: null, note: null }} pendingCount={1} guardMs={600} onDecide={onDecide} />);
+    return onDecide;
+  };
+  it('ignores a plain event (no focus move)', async () => {
+    vi.useFakeTimers();
+    card();
+    act(() => void vi.advanceTimersByTime(700));
+    window.dispatchEvent(new Event('workbench:focus-approval'));
+    act(() => void vi.advanceTimersByTime(50));
+    expect(screen.getByTestId('approval-card')).not.toHaveFocus();
+    vi.useRealTimers();
+  });
+  it('an explicit event focuses the card and re-arms the guard: ⌘↵ right after does nothing, later works', async () => {
+    vi.useFakeTimers();
+    const onDecide = card();
+    act(() => void vi.advanceTimersByTime(700));
+    act(() => requestFocusApproval());
+    act(() => void vi.advanceTimersByTime(10));
+    const el = screen.getByTestId('approval-card');
+    expect(el).toHaveFocus();
+    fireEvent.keyDown(el, { key: 'Enter', metaKey: true });
+    expect(onDecide).not.toHaveBeenCalled();
+    act(() => void vi.advanceTimersByTime(650));
+    fireEvent.keyDown(el, { key: 'Enter', metaKey: true });
+    await act(async () => void (await vi.advanceTimersByTimeAsync(0)));
+    expect(onDecide).toHaveBeenCalledTimes(1);
+    vi.useRealTimers();
   });
 });

@@ -22,39 +22,55 @@ export function DayBars({ data, today }: { data: LedgerSummary['by_day']; today?
   const days = fillDays(data, today);
   const W = 480;
   const H = 120;
-  const pad = 4;
-  const max = Math.max(...days.map((d) => d.usd), 0.0001);
-  const bw = (W - pad * 2) / days.length;
+  const padL = 40;
+  const padR = 4;
+  const top = 12;
+  const max = Math.max(...days.map((d) => d.usd), 0);
+  const scale = max > 0 ? max : 1;
+  const bw = (W - padL - padR) / days.length;
+  const ch = H - top;
   return (
-    <svg viewBox={`0 0 ${W} ${H + 18}`} className="bars" role="img" aria-label="Spend by day, last 14 days" data-testid="day-chart">
-      <line x1={pad} x2={W - pad} y1={H} y2={H} className="axis-line" />
-      {days.map((d, i) => {
-        const zero = d.usd <= 0;
-        const h = zero ? 2 : Math.max(2, (d.usd / max) * H);
-        return (
-          <g key={d.day}>
-            <rect
-              x={pad + i * bw + 2}
-              y={H - h}
-              width={Math.max(bw - 4, 2)}
-              height={h}
-              rx={zero ? 1 : 3}
-              className={zero ? 'bar zero' : 'bar'}
-              data-testid="day-bar"
-              data-day={d.day}
-              data-usd={d.usd}
-            >
-              <title>{`${d.day}: ${usd(d.usd)}`}</title>
-            </rect>
-            {(i % 2 === 0 || i === days.length - 1) && (
-              <text x={pad + i * bw + bw / 2} y={H + 13} textAnchor="middle" className="axis">
-                {d.day.slice(5)}
-              </text>
-            )}
-          </g>
-        );
-      })}
-    </svg>
+    <figure className="chart">
+      <svg viewBox={`0 0 ${W} ${H + 18}`} className="bars" role="img" aria-label="Spend by day, last 14 days" data-testid="day-chart">
+        <line x1={padL} x2={W - padR} y1={top} y2={top} className="axis-line grid" />
+        <line x1={padL} x2={W - padR} y1={H} y2={H} className="axis-line" />
+        <text x={padL - 4} y={top + 3} textAnchor="end" className="axis" data-testid="y-max">
+          {usd(max)}
+        </text>
+        <text x={padL - 4} y={H + 3} textAnchor="end" className="axis">
+          $0
+        </text>
+        {days.map((d, i) => {
+          const zero = d.usd <= 0;
+          const h = zero ? 2 : Math.max(2, (d.usd / scale) * ch);
+          return (
+            <g key={d.day}>
+              <rect
+                x={padL + i * bw + 2}
+                y={H - h}
+                width={Math.max(bw - 4, 2)}
+                height={h}
+                rx={zero ? 1 : 3}
+                className={zero ? 'bar zero' : 'bar'}
+                data-testid="day-bar"
+                data-day={d.day}
+                data-usd={d.usd}
+              >
+                <title>{`${d.day} (UTC): ${usd(d.usd)}`}</title>
+              </rect>
+              {(i % 2 === 0 || i === days.length - 1) && (
+                <text x={padL + i * bw + bw / 2} y={H + 13} textAnchor="middle" className="axis">
+                  {d.day.slice(5)}
+                </text>
+              )}
+            </g>
+          );
+        })}
+      </svg>
+      <figcaption className="muted chart-note" data-testid="chart-utc-note">
+        Days are UTC, so a bar can differ from your local date near midnight.
+      </figcaption>
+    </figure>
   );
 }
 

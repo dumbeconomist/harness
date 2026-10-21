@@ -33,3 +33,17 @@ export function fuzzyScore(query: string, text: string): number {
   }
   return score - t.length * 0.01;
 }
+
+/** "just now", "2 min ago", "3 h ago", or a date. */
+export function relativeTime(iso: string, now = Date.now()): string {
+  const t = Date.parse(iso);
+  if (Number.isNaN(t)) return iso;
+  const s = Math.max(0, Math.round((now - t) / 1000));
+  if (s < 10) return 'just now';
+  if (s < 60) return `${s} sec ago`;
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m} min ago`;
+  const h = Math.round(m / 60);
+  if (h < 24) return `${h} h ago`;
+  return new Date(t).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+}

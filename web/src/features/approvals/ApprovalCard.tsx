@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type KeyboardEvent } from 'react';
+import { isExplicitFocusRequest } from '../../lib/focusApproval';
 import { parseJsonish, type Approval, type Task } from '../../lib/types';
 
 export function tierLabel(tier: number): string {
@@ -117,11 +118,19 @@ export function ApprovalCard({ docked = false, approval, pendingCount, tasks = [
   const rootRef = useRef<HTMLElement>(null);
   // Buttons render disabled until the guard elapses (and again after Review): visibly inert, not silently dropped.
   const [ready, rearm] = useArm(guardMs);
+  const rearmRef = useRef(rearm);
+  rearmRef.current = rearm;
+  const guardMsRef = useRef(guardMs);
+  guardMsRef.current = guardMs;
 
   useEffect(() => {
     mountedAt.current = Date.now();
-    const focus = () => {
+    const focus = (e: Event) => {
+      if (!isExplicitFocusRequest(e)) return; // only explicit user actions may move focus here
       setCollapsed(false);
+      // Keys typed right after a programmatic focus move must do nothing: re-arm the guard.
+      mountedAt.current = Date.now();
+      if (guardMsRef.current > 0) rearmRef.current(guardMsRef.current);
       window.setTimeout(() => rootRef.current?.focus(), 0);
     };
     window.addEventListener('workbench:focus-approval', focus);

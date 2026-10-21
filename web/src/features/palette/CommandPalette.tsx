@@ -91,8 +91,8 @@ export function CommandPalette({ open, ctx, onClose }: Props) {
             <ResultView
               result={result}
               ctx={ctx}
-              onOpenInWorkbench={(q) => {
-                ctx.ui({ type: 'ask-in-chat', text: q });
+              onOpenInWorkbench={(i) => {
+                ctx.ui(i.threadId ? { type: 'open-thread', id: i.threadId } : { type: 'ask-in-chat', text: i.question });
                 onClose();
               }}
             />

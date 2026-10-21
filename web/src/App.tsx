@@ -10,9 +10,10 @@ import { LedgerView } from './features/ledger/LedgerView';
 import { SettingsView } from './features/settings/SettingsView';
 import { ChatPane } from './features/chat/ChatPane';
 import { CommandPalette } from './features/palette/CommandPalette';
-import { DoctorBanner } from './features/doctor/Doctor';
+import { DoctorStatus } from './features/doctor/Doctor';
 import { QuickBar } from './features/quick/QuickBar';
 import { type CommandCtx, type UiAction, type View, VIEWS } from './lib/commands';
+import { requestFocusApproval } from './lib/focusApproval';
 import { useApprovalAlerts } from './lib/alerts';
 import { consumeHandoff, HANDOFF_KEY } from './lib/handoff';
 
@@ -103,7 +104,7 @@ export function App() {
       if (!mod) return;
       if (e.shiftKey && e.key.toLowerCase() === 'a') {
         e.preventDefault();
-        window.dispatchEvent(new Event('workbench:focus-approval'));
+        requestFocusApproval();
       } else if (e.key.toLowerCase() === 'k') {
         e.preventDefault();
         setPaletteOpen((o) => !o);
@@ -140,9 +141,14 @@ export function App() {
         setChatOpen(true);
         window.setTimeout(() => window.dispatchEvent(new CustomEvent('workbench:prefill-chat', { detail: a.text })), 50);
         break;
+      case 'open-thread':
+        setSelectedId(null); // threads from the quick bar live in the general context
+        setChatOpen(true);
+        window.setTimeout(() => window.dispatchEvent(new CustomEvent('workbench:open-thread', { detail: a.id })), 50);
+        break;
       case 'focus-approval':
         // Focus only: the card keeps its own guards; nothing is decided from here.
-        window.setTimeout(() => window.dispatchEvent(new Event('workbench:focus-approval')), 50);
+        window.setTimeout(requestFocusApproval, 50);
         break;
       case 'open-task':
         setView('tasks');
@@ -220,6 +226,7 @@ export function App() {
           ))}
         </ul>
         <div className="sidebar-foot">
+          <DoctorStatus doctor={data.doctor} onOpen={() => setView('settings')} />
           <button className="nav-item" onClick={openPalette}>
             <span className="nav-icon" aria-hidden>
               ⌘
@@ -230,7 +237,6 @@ export function App() {
         </div>
       </nav>
 
-      <DoctorBanner doctor={data.doctor} onFix={() => setView('settings')} />
       <main className="main">
         {data.connection === 'lost' && (
           <div className="banner" role="status" data-testid="connection-banner">

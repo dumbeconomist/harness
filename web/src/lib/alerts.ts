@@ -1,18 +1,19 @@
 import { useEffect, useRef } from 'react';
 import type { Approval } from './types';
 import type { NativeBridge } from './native';
+import { pulseApproval, requestFocusApproval } from './focusApproval';
 
 /** How long after a notification a window activation may focus the approval card. */
 export const NOTIFY_FOCUS_WINDOW_MS = 2 * 60_000;
-/** Do not move focus if the user typed in an input this recently. */
-export const TYPING_GRACE_MS = 1000;
 
 export interface AlertDeps {
   now: () => number;
   isBackground: () => boolean;
   native: () => NativeBridge | undefined;
   browserNotify: (title: string, body: string, approvalId: string, onClick: () => void) => void;
-  /** Dispatch `workbench:focus-approval` (focuses the card container only; never a button). */
+  /** Visual highlight only (a short pulse on the card/badge). Must never move focus. */
+  highlight: () => void;
+  /** A real click on a browser notification is an explicit user action: focus the card. */
   focusApproval: () => void;
 }
 
@@ -25,12 +26,8 @@ export function createApprovalAlerts(deps: AlertDeps) {
   const notified = new Map<string, number>();
   let pending = new Set<string>();
   let badge = -1;
-  let lastTypedAt = -Infinity;
 
   return {
-    noteTyping() {
-      lastTypedAt = deps.now();
-    },
     /** Call whenever the pending approvals list changes. */
     sync(approvals: Approval[]) {
       pending = new Set(approvals.map((a) => a.id));
@@ -66,7 +63,7 @@ export function createApprovalAlerts(deps: AlertDeps) {
         }
       }
     },
-    /** The main window gained focus / became visible. */
+    /** The main window gained focus / became visible: highlight only. */
     onActivate() {
       const now = deps.now();
       let hit = false;
@@ -75,18 +72,13 @@ export function createApprovalAlerts(deps: AlertDeps) {
         else if (pending.has(id)) hit = true;
       }
       if (!hit) return;
-      if (now - lastTypedAt < TYPING_GRACE_MS) return; // never steal focus mid-typing
       notified.clear(); // once
-      deps.focusApproval();
+      // Never move focus on activation: WebKit restores the composer first, and a focus move here would
+      // let ⌘↵ typed for a draft land on the card. A pulse tells the user where to look instead.
+      deps.highlight();
     },
     _notifiedCount: () => notified.size,
   };
-}
-
-function isEditable(t: EventTarget | null): boolean {
-  const el = t as HTMLElement | null;
-  if (!el || !el.tagName) return false;
-  return el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT' || el.isContentEditable === true;
 }
 
 /** Wires the tracker to the DOM and keeps it fed with the pending approvals. Main window only. */
@@ -109,23 +101,19 @@ export function useApprovalAlerts(approvals: Approval[]) {
           /* ignore */
         }
       },
-      focusApproval: () => window.dispatchEvent(new Event('workbench:focus-approval')),
+      highlight: () => pulseApproval(),
+      focusApproval: () => requestFocusApproval(),
     });
   }
   const alerts = ref.current;
 
   useEffect(() => {
-    const typed = (e: Event) => isEditable(e.target) && alerts.noteTyping();
     const activate = () => {
       if (document.visibilityState === 'visible') alerts.onActivate();
     };
-    document.addEventListener('keydown', typed, true);
-    document.addEventListener('input', typed, true);
     window.addEventListener('focus', activate);
     document.addEventListener('visibilitychange', activate);
     return () => {
-      document.removeEventListener('keydown', typed, true);
-      document.removeEventListener('input', typed, true);
       window.removeEventListener('focus', activate);
       document.removeEventListener('visibilitychange', activate);
     };

@@ -80,6 +80,7 @@ CREATE TABLE messages(
 );
 CREATE INDEX messages_thread ON messages(thread_id);
 "#,
+    "ALTER TABLE messages ADD COLUMN status TEXT NOT NULL DEFAULT 'ok' CHECK (status IN ('ok','failed','partial'));",
 ];
 
 #[derive(Clone)]

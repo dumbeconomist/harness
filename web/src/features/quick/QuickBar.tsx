@@ -44,8 +44,14 @@ export function useApprovalCount(api: Api): number {
 
 /** Hand an action to the main window: native shell if present, otherwise navigate this tab to the app. */
 export function sendToMain(action?: UiAction) {
+  // Only the explicit "approvals waiting" link may ask the shell to focus the approval card.
+  const focusApproval = action?.type === 'focus-approval';
+  if (openMainWindow(focusApproval)) {
+    if (action && !focusApproval) postHandoff(action); // the shell dispatches the focus event itself
+    return;
+  }
   if (action) postHandoff(action);
-  if (!openMainWindow()) window.location.hash = '#/';
+  window.location.hash = '#/';
 }
 
 export function QuickBar({ api = defaultApi }: { api?: Api }) {
@@ -84,6 +90,20 @@ export function QuickBar({ api = defaultApi }: { api?: Api }) {
     setNavigated(false);
   }, []);
 
+  // Whenever the window hides or loses focus, forget everything (and abort any stream).
+  useEffect(() => {
+    const onHide = () => reset();
+    const vis = () => document.visibilityState === 'hidden' && reset();
+    window.addEventListener('blur', onHide);
+    window.addEventListener('workbench:quick-hidden', onHide);
+    document.addEventListener('visibilitychange', vis);
+    return () => {
+      window.removeEventListener('blur', onHide);
+      window.removeEventListener('workbench:quick-hidden', onHide);
+      document.removeEventListener('visibilitychange', vis);
+    };
+  }, [reset]);
+
   const hide = useCallback(() => {
     reset(); // aborts any streaming answer (ResultView unmounts)
     hideQuickWindow();
@@ -101,7 +121,10 @@ export function QuickBar({ api = defaultApi }: { api?: Api }) {
 
   const submit = (highlighted: Command | undefined, explicit = navigated) => {
     const plan = planSubmit(input, input.trim() === '' && !explicit ? undefined : highlighted, { freeTextAsk: true }, commands);
-    if (plan.action === 'fill') setInput(plan.text);
+    if (plan.action === 'fill') {
+      setInput(plan.text);
+      setResult(null);
+    }
     else if (plan.action === 'error') setResult({ kind: 'error', message: plan.message });
     else if (plan.action === 'run') void exec(plan.command, plan.args);
   };
@@ -124,6 +147,7 @@ export function QuickBar({ api = defaultApi }: { api?: Api }) {
           setInput(e.target.value);
           setIndex(0);
           setNavigated(false);
+          setResult(null); // a stale answer/result never lingers under new input
         }}
         onKeyDown={(e) => {
           if (e.key === 'Escape') {
@@ -146,7 +170,7 @@ export function QuickBar({ api = defaultApi }: { api?: Api }) {
       />
       <div className="quick-body">
         {result && (
-          <ResultView result={result} ctx={ctx} onOpenInWorkbench={(q) => sendToMain({ type: 'ask-in-chat', text: q })} />
+          <ResultView result={result} ctx={ctx} onOpenInWorkbench={(i) => sendToMain(i.threadId ? { type: 'open-thread', id: i.threadId } : { type: 'ask-in-chat', text: i.question })} />
         )}
         {showList && (
           <ul role="listbox" className="quick-list" aria-label="Suggestions">

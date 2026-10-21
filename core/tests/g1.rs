@@ -22,6 +22,7 @@ struct Cfg {
     require_key: Option<&'static str>,
     toolsets: Option<Value>,
     chat_status: u16,
+    models_status: u16,
     seen_toolsets_auth: Arc<Mutex<Vec<Option<String>>>>,
 }
 
@@ -31,6 +32,7 @@ impl Cfg {
             require_key: None,
             toolsets: Some(json!([{"name": "web", "enabled": false}])),
             chat_status: 200,
+            models_status: 200,
             seen_toolsets_auth: Default::default(),
         }
     }
@@ -48,6 +50,11 @@ fn authed(cfg: &Cfg, h: &HeaderMap) -> bool {
 async fn f_models(State(cfg): State<Cfg>, h: HeaderMap) -> Response {
     if !authed(&cfg, &h) {
         return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if cfg.models_status != 200 {
+        return StatusCode::from_u16(cfg.models_status)
+            .unwrap()
+            .into_response();
     }
     Json(json!({"data": [{"id": "hermes-agent"}]})).into_response()
 }
@@ -207,7 +214,9 @@ async fn doctor_ok_without_mcp_connect_warns() {
     assert_eq!(m["status"], "warn");
     assert_eq!(m["blocking"], false);
     assert!(m["fix"].as_str().unwrap().contains("WORKBENCH_MCP_TOKEN"));
-    assert_eq!(check(&d, "mcp_tools_seen")["status"], "warn");
+    let t = check(&d, "mcp_tools_seen");
+    assert_eq!(t["status"], "skip");
+    assert_eq!(t["message"], "Waiting for Hermes to connect");
     assert_eq!(check(&d, "profile_locked")["status"], "ok");
     h.shutdown().await;
 }
@@ -335,9 +344,21 @@ async fn doctor_deep_model_check() {
     // passing
     let url = spawn_fake(Cfg::new()).await;
     let h = Harness::start_with(30, &url).await;
+    // before any deep run, a plain poll reports the model as not tested
+    let d = doctor(&h, false).await;
+    assert_eq!(check(&d, "hermes_model")["status"], "skip");
+    assert!(check(&d, "hermes_model")["checked_at"].is_null());
     let d = doctor(&h, true).await;
     assert_eq!(check(&d, "hermes_model")["status"], "ok");
+    assert!(check(&d, "hermes_model")["checked_at"].is_string());
     assert_eq!(d["ok"], true);
+    let d = doctor(&h, false).await;
+    let m = check(&d, "hermes_model");
+    assert_eq!(m["status"], "ok");
+    assert!(
+        m["checked_at"].is_string(),
+        "cached deep result is included"
+    );
     h.shutdown().await;
 
     // failing: the upstream error is surfaced and later checks are skipped
@@ -355,10 +376,14 @@ async fn doctor_deep_model_check() {
     assert_eq!(d["ok"], false);
     assert_eq!(check(&d, "mcp_connected")["status"], "skip");
     assert_eq!(check(&d, "profile_locked")["status"], "skip");
-    // without ?deep=1 the same server passes (model is not exercised)
+    // the failure does not vanish on the next plain poll: it is replayed with checked_at
     let d = doctor(&h, false).await;
-    assert_eq!(check(&d, "hermes_model")["status"], "skip");
-    assert_eq!(d["ok"], true);
+    let m = check(&d, "hermes_model");
+    assert_eq!(m["status"], "fail");
+    assert!(m["checked_at"].is_string());
+    assert!(m["message"].as_str().unwrap().contains("model not found"));
+    assert_eq!(d["ok"], false);
+    assert_eq!(check(&d, "profile_locked")["status"], "skip");
     h.shutdown().await;
 }
 
@@ -509,8 +534,8 @@ async fn chat_with_thread_persists_messages_and_sends_session_header() {
     let cap = fake.captured.lock().unwrap().requests.clone();
     assert_eq!(
         cap[0].2.as_deref(),
-        Some(tid),
-        "X-Hermes-Session-Id is the thread id"
+        Some(format!("wb-{tid}").as_str()),
+        "X-Hermes-Session-Id is wb-<thread id>"
     );
 
     // first message titles the thread
@@ -561,7 +586,7 @@ async fn thread_history_replays_in_order_and_ignores_body_history() {
         ],
         "tool rows are not replayed"
     );
-    assert_eq!(cap[1].2.as_deref(), Some(tid));
+    assert_eq!(cap[1].2.as_deref(), Some(format!("wb-{tid}").as_str()));
     let n = h.get(&format!("/api/threads/{tid}/messages")).await;
     assert_eq!(n.as_array().unwrap().len(), 6);
     h.shutdown().await;
@@ -770,5 +795,253 @@ async fn ledger_summary_zero_fills_exactly_fourteen_utc_days() {
     assert_eq!(s["last7_usd"], 2.0);
     assert_eq!(s["last30_usd"], 4.0);
     assert_eq!(s["total_usd"], 5.0);
+    h.shutdown().await;
+}
+
+// ------------------------------------------------- round 2: new behaviours
+
+#[tokio::test]
+async fn doctor_models_5xx_warns_reachable() {
+    let mut cfg = Cfg::new();
+    cfg.models_status = 503;
+    let url = spawn_fake(cfg).await;
+    let h = Harness::start_with(30, &url).await;
+    let d = doctor(&h, false).await;
+    let r = check(&d, "hermes_reachable");
+    assert_eq!(r["status"], "warn");
+    assert_eq!(r["message"], "Hermes answered with an error (HTTP 503)");
+    assert_eq!(d["ok"], true);
+    h.shutdown().await;
+}
+
+// A fake that can fail, echo the caller's secrets back, and stream slowly.
+#[derive(Clone)]
+struct TFake {
+    fail: Arc<std::sync::atomic::AtomicBool>,
+    delay_ms: u64,
+    bodies: Arc<Mutex<Vec<Value>>>,
+}
+
+async fn t_chat(State(f): State<TFake>, Json(body): Json<Value>) -> Response {
+    use std::sync::atomic::Ordering;
+    f.bodies.lock().unwrap().push(body.clone());
+    if f.fail.load(Ordering::SeqCst) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": {"message":
+                "bad credentials: Bearer hermes-secret / ui test-token / mcp test-mcp-token"}})),
+        )
+            .into_response();
+    }
+    if body["stream"] != true {
+        return Json(json!({"choices": [{"message": {"content": "p"}}]})).into_response();
+    }
+    let delay = f.delay_ms;
+    let mut chunks: Vec<String> = ["A", "B", "C", "D"]
+        .iter()
+        .map(|t| {
+            format!(
+                "data: {}\n\n",
+                json!({"model": "hermes-agent", "choices":[{"delta":{"content": t}}]})
+            )
+        })
+        .collect();
+    chunks.push(format!(
+        "data: {}\n\n",
+        json!({"model":"hermes-agent","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":7}})
+    ));
+    chunks.push("data: [DONE]\n\n".into());
+    let stream = futures::stream::iter(chunks).then(move |c| async move {
+        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+        Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(c))
+    });
+    Response::builder()
+        .header("content-type", "text/event-stream")
+        .body(axum::body::Body::from_stream(stream))
+        .unwrap()
+}
+
+use futures::StreamExt;
+
+async fn spawn_tfake(fail: bool, delay_ms: u64) -> (String, TFake) {
+    let f = TFake {
+        fail: Arc::new(std::sync::atomic::AtomicBool::new(fail)),
+        delay_ms,
+        bodies: Default::default(),
+    };
+    let app = Router::new()
+        .route("/v1/models", get(f_models_open))
+        .route("/v1/chat/completions", post(t_chat))
+        .with_state(f.clone());
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(l, app).await.unwrap();
+    });
+    (format!("http://{addr}/v1"), f)
+}
+
+async fn f_models_open() -> Json<Value> {
+    Json(json!({"data": []}))
+}
+
+fn db_doctor_json(h: &Harness) -> String {
+    let c = rusqlite::Connection::open(h.dir.path().join("workbench.db")).unwrap();
+    c.query_row(
+        "SELECT value_json FROM settings WHERE key='doctor'",
+        [],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+const SECRETS: [&str; 3] = ["hermes-secret", "test-token", "test-mcp-token"];
+
+#[tokio::test]
+async fn echoed_secrets_never_reach_storage_doctor_or_sse() {
+    let (url, _f) = spawn_tfake(true, 0).await;
+    let h = Harness::start_with(30, &url).await;
+
+    // deep doctor path
+    let d = doctor(&h, true).await;
+    let m = check(&d, "hermes_model");
+    assert_eq!(m["status"], "fail");
+    assert!(m["message"].as_str().unwrap().contains("bad credentials"));
+    let raw = d.to_string();
+    for s in SECRETS {
+        assert!(!raw.contains(s), "doctor response leaked {s}: {raw}");
+    }
+    let stored = db_doctor_json(&h);
+    assert!(stored.contains("bad credentials"));
+    for s in SECRETS {
+        assert!(!stored.contains(s), "settings.doctor leaked {s}: {stored}");
+    }
+
+    // chat SSE path
+    let text = h
+        .req(Method::POST, "/api/chat")
+        .json(&json!({"messages":[{"role":"user","content":"hi"}]}))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(text.contains("event: error"), "{text}");
+    assert!(text.contains("bad credentials"));
+    for s in SECRETS {
+        assert!(!text.contains(s), "SSE error leaked {s}: {text}");
+    }
+    let stored = db_doctor_json(&h);
+    for s in SECRETS {
+        assert!(!stored.contains(s), "settings.doctor leaked {s} after chat");
+    }
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn failed_turns_are_marked_and_not_replayed() {
+    let (url, f) = spawn_tfake(true, 0).await;
+    let h = Harness::start_with(30, &url).await;
+    let (_, t) = h.post("/api/threads", json!({})).await;
+    let tid = t["id"].as_str().unwrap();
+    let evs = chat_in_thread(&h, tid, "this one fails").await;
+    assert_eq!(evs.last().unwrap().0, "error");
+    let msgs = h.get(&format!("/api/threads/{tid}/messages")).await;
+    assert_eq!(msgs.as_array().unwrap().len(), 1);
+    assert_eq!(msgs[0]["status"], "failed");
+
+    f.fail.store(false, std::sync::atomic::Ordering::SeqCst);
+    let evs = chat_in_thread(&h, tid, "this one works").await;
+    assert_eq!(evs.last().unwrap().0, "done");
+    let sent = f.bodies.lock().unwrap().last().unwrap()["messages"].clone();
+    let sent: Vec<_> = sent
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["content"].as_str().unwrap())
+        .collect();
+    assert_eq!(sent, ["this one works"], "failed turn excluded from replay");
+    let msgs = h.get(&format!("/api/threads/{tid}/messages")).await;
+    let st: Vec<_> = msgs
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["status"].as_str().unwrap())
+        .collect();
+    assert_eq!(st, ["failed", "ok", "ok"]);
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn client_drop_keeps_partial_reply_and_ledger() {
+    let (url, _f) = spawn_tfake(false, 120).await;
+    let h = Harness::start_with(30, &url).await;
+    let (_, t) = h.post("/api/threads", json!({})).await;
+    let tid = t["id"].as_str().unwrap();
+    let mut resp = h
+        .req(Method::POST, "/api/chat")
+        .json(&json!({"thread_id": tid, "messages":[{"role":"user","content":"go"}]}))
+        .send()
+        .await
+        .unwrap();
+    let mut seen = String::new();
+    while !seen.contains("event: delta") {
+        let c = resp.chunk().await.unwrap().expect("stream ended early");
+        seen.push_str(&String::from_utf8_lossy(&c));
+    }
+    drop(resp); // the user pressed stop / closed the window
+
+    let mut found = None;
+    for _ in 0..100 {
+        let msgs = h.get(&format!("/api/threads/{tid}/messages")).await;
+        if let Some(m) = msgs
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "assistant")
+        {
+            found = Some(m.clone());
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let m = found.expect("partial assistant message was persisted");
+    assert_eq!(m["status"], "partial");
+    assert!(m["content"].as_str().unwrap().starts_with('A'));
+    let entries = h.get("/api/ledger/entries").await;
+    assert_eq!(
+        entries.as_array().unwrap().len(),
+        1,
+        "usage that arrived is recorded"
+    );
+    assert_eq!(entries[0]["prompt_tokens"], 5);
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn threads_sort_by_recent_activity() {
+    let fake = fake_hermes("hermes-agent", None).await;
+    let h = Harness::start_with(30, &fake.url).await;
+    let (_, a) = h.post("/api/threads", json!({})).await;
+    let (_, b) = h.post("/api/threads", json!({})).await;
+    let ids = |v: &Value| -> Vec<String> {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let (aid, bid) = (
+        a["id"].as_str().unwrap().to_string(),
+        b["id"].as_str().unwrap().to_string(),
+    );
+    assert_eq!(
+        ids(&h.get("/api/threads").await),
+        [bid.clone(), aid.clone()]
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    chat_in_thread(&h, &aid, "bump").await;
+    assert_eq!(ids(&h.get("/api/threads").await), [aid, bid]);
     h.shutdown().await;
 }

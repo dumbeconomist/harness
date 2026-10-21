@@ -1,34 +1,57 @@
 import { useEffect, useRef, useState } from 'react';
 import { streamChat } from '../../lib/sse';
+import { ApiError } from '../../lib/api';
 import { UNDO_ARM_MS, describeEntry, type CommandCtx, type CommandResult } from '../../lib/commands';
 import { timeAgo } from '../../lib/format';
 import type { JournalEntry } from '../../lib/types';
 
-/** Streams an answer from Hermes. Ephemeral: no thread, nothing is persisted except the ledger entry. */
-export function AskResult({ question, ctx, onOpenInWorkbench }: { question: string; ctx: CommandCtx; onOpenInWorkbench?: (q: string) => void }) {
+export interface OpenInfo {
+  question: string;
+  /** The real general thread the ask ran in (Q&A already persisted there), when one could be created. */
+  threadId?: string;
+}
+
+/**
+ * Streams an answer from Hermes inside a real "general" thread (created first, thread_id sent), so
+ * "Open in Workbench" can show that exact thread with the Q&A already in it. No re-send.
+ */
+export function AskResult({ question, ctx, onOpenInWorkbench }: { question: string; ctx: CommandCtx; onOpenInWorkbench?: (i: OpenInfo) => void }) {
   const [text, setText] = useState('');
   const [state, setState] = useState<'streaming' | 'done' | 'error'>('streaming');
   const [error, setError] = useState('');
+  const [threadId, setThreadId] = useState<string | undefined>();
   const cfg = ctx.api.config;
+  const createThread = ctx.api.createThread;
   useEffect(() => {
     const ac = new AbortController();
     setText('');
     setState('streaming');
-    void streamChat(
-      cfg,
-      { messages: [{ role: 'user', content: question }] },
-      {
-        onDelta: (t) => setText((s) => s + t),
-        onDone: () => setState('done'),
-        onError: (m) => {
-          setError(m);
-          setState('error');
+    setThreadId(undefined);
+    void (async () => {
+      let tid: string | undefined;
+      try {
+        tid = (await createThread({ context_kind: 'general', context_id: 'general', title: question.slice(0, 60) })).id;
+      } catch {
+        tid = undefined; // core without threads: the answer still streams, just not persisted
+      }
+      if (ac.signal.aborted) return;
+      setThreadId(tid);
+      await streamChat(
+        cfg,
+        { messages: [{ role: 'user', content: question }], ...(tid ? { thread_id: tid } : {}) },
+        {
+          onDelta: (t) => setText((s) => s + t),
+          onDone: () => setState('done'),
+          onError: (m) => {
+            setError(m);
+            setState('error');
+          },
         },
-      },
-      ac.signal,
-    );
+        ac.signal,
+      );
+    })();
     return () => ac.abort();
-  }, [cfg, question]);
+  }, [cfg, createThread, question]);
   return (
     <div className="qr qr-ask" data-testid="ask-result">
       <div className="qr-q muted">{question}</div>
@@ -40,9 +63,9 @@ export function AskResult({ question, ctx, onOpenInWorkbench }: { question: stri
           {error}
         </div>
       )}
-      {onOpenInWorkbench && (
+      {onOpenInWorkbench && state === 'done' && (
         <div className="qr-actions">
-          <button className="btn small" onClick={() => onOpenInWorkbench(question)} data-testid="open-in-workbench">
+          <button className="btn small" onClick={() => onOpenInWorkbench({ question, threadId })} data-testid="open-in-workbench">
             Open in Workbench
           </button>
         </div>
@@ -57,7 +80,7 @@ export function AskResult({ question, ctx, onOpenInWorkbench }: { question: stri
  */
 export function UndoResult({ entry, ctx, onDone }: { entry: JournalEntry | null; ctx: CommandCtx; onDone?: () => void }) {
   const [armed, setArmed] = useState(false);
-  const [state, setState] = useState<'idle' | 'busy' | 'done' | 'error'>('idle');
+  const [state, setState] = useState<'idle' | 'busy' | 'done' | 'error' | 'stale'>('idle');
   const [msg, setMsg] = useState('');
   const busy = useRef(false);
   const id = entry?.id;
@@ -85,8 +108,12 @@ export function UndoResult({ entry, ctx, onDone }: { entry: JournalEntry | null;
       setMsg(`Undone: ${describeEntry(entry)}`);
       onDone?.();
     } catch (e) {
-      setState('error');
-      setMsg(e instanceof Error ? e.message : String(e));
+      if (e instanceof ApiError && e.status === 409) {
+        setState('stale'); // changed since: no Confirm, friendly text, no raw ids
+      } else {
+        setState('error');
+        setMsg(e instanceof Error ? e.message : String(e));
+      }
     } finally {
       busy.current = false;
     }
@@ -107,7 +134,15 @@ export function UndoResult({ entry, ctx, onDone }: { entry: JournalEntry | null;
           {msg}
         </div>
       )}
-      {state !== 'done' && (
+      {state === 'stale' && (
+        <div className="msg-error" role="alert" data-testid="undo-stale">
+          This changed after that action, so undo the newer change first.{' '}
+          <button className="link" onClick={() => ctx.ui({ type: 'goto', view: 'journal' })}>
+            Open Activity
+          </button>
+        </div>
+      )}
+      {state !== 'done' && state !== 'stale' && (
         <div className="qr-actions">
           {armed ? (
             <button
@@ -139,7 +174,7 @@ export function ResultView({
 }: {
   result: CommandResult;
   ctx: CommandCtx;
-  onOpenInWorkbench?: (q: string) => void;
+  onOpenInWorkbench?: (i: OpenInfo) => void;
 }) {
   switch (result.kind) {
     case 'none':

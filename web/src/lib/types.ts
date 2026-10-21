@@ -113,10 +113,13 @@ export interface DoctorCheck {
   status: CheckStatus;
   message: string;
   fix?: string;
+  /** Raw upstream error, shown collapsed under "Details". */
+  detail?: string;
   blocking: boolean;
 }
 export interface Doctor {
   ok: boolean;
+  checked_at?: string;
   checks: DoctorCheck[];
 }
 
@@ -134,6 +137,7 @@ export interface ThreadMessage {
   role: 'user' | 'assistant' | 'tool';
   content: string;
   tool_json: string | Record<string, unknown> | null;
+  status?: 'ok' | 'failed' | 'partial';
   created_at: string;
 }
 

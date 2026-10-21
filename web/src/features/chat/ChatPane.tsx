@@ -12,6 +12,10 @@ export interface Msg {
   content: string;
   error?: string;
   streaming?: boolean;
+  /** Persisted user turn that never reached Hermes. */
+  notSent?: boolean;
+  /** Persisted assistant reply cut off part-way. */
+  interrupted?: boolean;
   tools?: { name: string; status: ToolStatus }[];
 }
 
@@ -54,15 +58,20 @@ export function threadToMsgs(rows: ThreadMessage[]): Msg[] {
   for (const r of rows) {
     if (r.role === 'tool') tools.push(toolChip(r));
     else if (r.role === 'assistant') {
-      out.push({ id: nextId++, role: 'assistant', content: r.content, ...(tools.length ? { tools } : {}) });
+      out.push({ id: nextId++, role: 'assistant', content: r.content, ...(tools.length ? { tools } : {}), ...(r.status === 'partial' ? { interrupted: true } : {}) });
       tools = [];
     } else {
       flushToLastAssistant();
-      out.push({ id: nextId++, role: 'user', content: r.content });
+      out.push({ id: nextId++, role: 'user', content: r.content, ...(r.status === 'failed' ? { notSent: true } : {}) });
     }
   }
   flushToLastAssistant();
   return out;
+}
+
+/** Most recently updated first (core also sorts; this keeps local bumps in order). */
+export function sortThreads(list: Thread[]): Thread[] {
+  return [...list].sort((a, b) => (b.updated_at || b.created_at).localeCompare(a.updated_at || a.created_at));
 }
 
 export function ChatPane({ api, cfg, context, contextLabel, hidden, onOpenSettings, onClose, slot }: Props) {
@@ -79,6 +88,8 @@ export function ChatPane({ api, cfg, context, contextLabel, hidden, onOpenSettin
   const logRef = useRef<HTMLDivElement>(null);
   const aborts = useRef<Record<string, AbortController>>({});
   const requested = useRef<Set<string>>(new Set());
+  const apiRef = useRef(api);
+  apiRef.current = api;
   const activeId = active[key];
   const current = activeId ? chats[activeId] : undefined;
   const messages = current ?? NO_MESSAGES;
@@ -92,10 +103,30 @@ export function ChatPane({ api, cfg, context, contextLabel, hidden, onOpenSettin
       if (typeof text === 'string' && text) setDraft(text);
       focus();
     };
+    // Show a specific general thread (e.g. an ask from the quick bar) with its persisted Q&A. Never re-sends.
+    const openThread = (e: Event) => {
+      const id = (e as CustomEvent<string>).detail;
+      if (typeof id !== 'string' || !id) return;
+      const gk = 'general:general';
+      requested.current.delete(`msgs:${id}`);
+      requested.current.delete(`threads:${gk}`);
+      setChats((c) => {
+        const rest = { ...c };
+        delete rest[id];
+        return rest;
+      });
+      setActive((a) => ({ ...a, [gk]: id }));
+      apiRef.current
+        .listThreads('general', 'general')
+        .then((list) => setThreads((t) => ({ ...t, [gk]: sortThreads(list) })))
+        .catch(() => undefined);
+    };
+    window.addEventListener('workbench:open-thread', openThread);
     window.addEventListener('workbench:focus-chat', focus);
     window.addEventListener('workbench:prefill-chat', prefill);
     const ctl = aborts.current;
     return () => {
+      window.removeEventListener('workbench:open-thread', openThread);
       window.removeEventListener('workbench:focus-chat', focus);
       window.removeEventListener('workbench:prefill-chat', prefill);
       Object.values(ctl).forEach((a) => a.abort());
@@ -115,9 +146,9 @@ export function ChatPane({ api, cfg, context, contextLabel, hidden, onOpenSettin
         setThreads((t) => {
           const have = t[key] ?? [];
           const extra = have.filter((h) => !list.some((l) => l.id === h.id)); // created while this was loading
-          return { ...t, [key]: [...extra, ...list] };
+          return { ...t, [key]: sortThreads([...extra, ...list]) };
         });
-        setActive((a) => (a[key] === undefined ? { ...a, [key]: list[0]?.id ?? null } : a));
+        setActive((a) => (a[key] === undefined ? { ...a, [key]: sortThreads(list)[0]?.id ?? null } : a));
       })
       .catch(() => {
         requested.current.delete(reqKey);
@@ -165,8 +196,8 @@ export function ChatPane({ api, cfg, context, contextLabel, hidden, onOpenSettin
     window.setTimeout(() => inputRef.current?.focus(), 0);
   };
 
-  const send = async () => {
-    const text = draft.trim();
+  const send = async (override?: string) => {
+    const text = (override ?? draft).trim();
     if (!text || busy) return;
     const k = key;
     const c = ctx;
@@ -180,7 +211,7 @@ export function ChatPane({ api, cfg, context, contextLabel, hidden, onOpenSettin
         const t = await api.createThread({ context_kind: c.kind, context_id: c.id, title: text.slice(0, 60) });
         tid = t.id;
         persisted = true;
-        setThreads((all) => ({ ...all, [k]: [t, ...(all[k] ?? [])] }));
+        setThreads((all) => ({ ...all, [k]: sortThreads([t, ...(all[k] ?? [])]) }));
         setChats((all) => ({ ...all, [t.id]: [] }));
       } catch {
         tid = `local:${k}`; // core without threads: keep the old in-memory behaviour
@@ -195,7 +226,7 @@ export function ChatPane({ api, cfg, context, contextLabel, hidden, onOpenSettin
       : (chats[threadId] ?? [])
           .filter((m) => !m.error && m.content)
           .map((m) => ({ role: m.role, content: m.content }));
-    setDraft('');
+    if (override === undefined) setDraft('');
     setChats((all) => ({
       ...all,
       [threadId]: [
@@ -204,6 +235,10 @@ export function ChatPane({ api, cfg, context, contextLabel, hidden, onOpenSettin
         { id: nextId++, role: 'assistant', content: '', streaming: true },
       ],
     }));
+    if (persisted) {
+      const stamp = new Date().toISOString();
+      setThreads((all) => ({ ...all, [k]: sortThreads((all[k] ?? []).map((t) => (t.id === threadId ? { ...t, updated_at: stamp } : t))) }));
+    }
     const ac = new AbortController();
     aborts.current[k] = ac;
     await streamChat(
@@ -300,7 +335,20 @@ export function ChatPane({ api, cfg, context, contextLabel, hidden, onOpenSettin
                 ))}
               </div>
             )}
+            {m.notSent && (
+              <div className="msg-note" data-testid="not-sent">
+                not sent –{' '}
+                <button className="link" disabled={busy} onClick={() => void send(m.content)}>
+                  retry
+                </button>
+              </div>
+            )}
             {m.content || (m.streaming && !m.error ? <span className="typing">Thinking…</span> : null)}
+            {m.interrupted && (
+              <div className="msg-note muted" data-testid="interrupted">
+                (interrupted)
+              </div>
+            )}
             {m.error && (
               <div className="msg-error" role="alert">
                 {m.error}{' '}

@@ -55,7 +55,13 @@ test.describe('G1 quick bar', () => {
     await page.screenshot({ path: shot('33-quick-ask') });
     await page.getByTestId('open-in-workbench').click();
     await expect(page.getByRole('heading', { name: 'Tasks' })).toBeVisible();
-    await expect(page.getByLabel('Message Hermes')).toHaveValue('what is on my plate');
+    // the exact thread opens with the Q&A already in it; nothing was re-sent
+    await expect(page.getByTestId('msg-user')).toHaveCount(1);
+    await expect(page.getByTestId('msg-user')).toContainText('what is on my plate');
+    await expect(page.getByTestId('msg-assistant')).toContainText('Mock Hermes heard');
+    await page.waitForTimeout(500);
+    await expect(page.getByTestId('msg-user')).toHaveCount(1);
+    await expect(page.getByLabel('Message Hermes')).toHaveValue('');
   });
 
   test('an approval arriving while the quick route is open is not decided by Enter spam', async ({ page, request }) => {
@@ -93,7 +99,7 @@ test.describe('G1 connection doctor', () => {
     await expect(reach).toHaveAttribute('data-status', 'ok');
     await expect(page.getByTestId('doctor-check-hermes_auth')).toHaveAttribute('data-status', 'ok');
     await expect(page.getByTestId('doctor-check-profile_locked')).toHaveAttribute('data-status', /ok|warn/);
-    await expect(page.getByTestId('doctor-banner')).toHaveCount(0);
+    await expect(page.getByTestId('doctor-status')).toHaveCount(0);
     await page.screenshot({ path: shot('35-doctor-ok') });
 
     try {
@@ -102,11 +108,13 @@ test.describe('G1 connection doctor', () => {
       await expect(reach).toHaveAttribute('data-status', 'fail');
       await expect(page.getByTestId('doctor-fix-hermes_reachable')).toContainText('hermes -p workbench gateway run');
       await expect(page.getByTestId('doctor-summary')).toContainText('needs attention');
-      await expect(page.getByTestId('doctor-banner')).toContainText('hermes -p workbench gateway run');
+      // sidebar status item (stable slot above Commands): visible, clickable, opens Settings
+      await expect(page.getByTestId('doctor-status')).toContainText('Connection');
       await page.screenshot({ path: shot('36-doctor-fail-banner') });
-      // banner is dismissable for the session
-      await page.getByTestId('doctor-banner').getByLabel('Dismiss').click();
-      await expect(page.getByTestId('doctor-banner')).toHaveCount(0);
+      await page.getByRole('button', { name: /Tasks/ }).click();
+      await page.getByTestId('doctor-status').click();
+      await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();
+      await expect(page.getByTestId('doctor-panel')).toBeVisible();
       await page.getByRole('button', { name: 'Run', exact: true }).click();
       await expect(reach).toHaveAttribute('data-status', 'fail');
     } finally {
@@ -114,14 +122,14 @@ test.describe('G1 connection doctor', () => {
       await page.getByRole('button', { name: 'Save' }).click();
     }
     await expect(reach).toHaveAttribute('data-status', 'ok');
-    await expect(page.getByTestId('doctor-banner')).toHaveCount(0);
+    await expect(page.getByTestId('doctor-status')).toHaveCount(0);
   });
 
   test('/status in the quick bar reports the checks', async ({ page }) => {
     await page.goto('/#/quick');
     await page.getByLabel('Quick command').fill('/status');
     await page.getByLabel('Quick command').press('Enter');
-    await expect(page.getByTestId('status-result')).toContainText('Hermes is running');
+    await expect(page.getByTestId('status-result')).toContainText('Hermes API');
   });
 });
 
@@ -176,5 +184,73 @@ test.describe('G1 ledger', () => {
     expect(await page.locator('rect.bar.zero').count()).toBeGreaterThanOrEqual(1);
     await expect(page.getByTestId('run-row').first()).toBeVisible();
     await page.screenshot({ path: shot('39-ledger-chart') });
+  });
+});
+
+test.describe('G1 notification re-activation (P0 regression)', () => {
+  test('draft in the composer, notification, re-activation, then typing + ⌘↵ never decides and keeps focus', async ({ page, request }) => {
+    await page.addInitScript(() => {
+      const w = window as unknown as Record<string, unknown>;
+      w.__bg = false;
+      w.__notified = [];
+      document.hasFocus = () => !w.__bg;
+      w.__WORKBENCH_NATIVE__ = {
+        notify: (title: string, body: string, id: string) => (w.__notified as unknown[]).push({ title, body, id }),
+        setBadge: () => undefined,
+      };
+    });
+    await page.goto('/');
+    await expect(page.getByRole('heading', { name: 'Tasks' })).toBeVisible();
+    const composer = page.getByLabel('Message Hermes');
+    await composer.click();
+    await page.keyboard.type('my draft');
+    await page.evaluate(() => ((window as unknown as { __bg: boolean }).__bg = true)); // app in background
+
+    const title = `Reactivate ${Date.now()}`;
+    const pending = callTool(request, 'tasks_create', { title });
+    await expect(page.getByTestId('approval-card')).toBeVisible();
+    await expect.poll(() => page.evaluate(() => (window as unknown as { __notified: unknown[] }).__notified.length)).toBe(1);
+    await page.waitForTimeout(900); // past every guard: only focus behaviour is under test
+
+    // user comes back: WebKit restores focus to the composer, then the app sees activation
+    await page.evaluate(() => {
+      (window as unknown as { __bg: boolean }).__bg = false;
+      window.dispatchEvent(new Event('focus'));
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+    await expect(page.locator('html')).toHaveAttribute('data-approval-pulse', ''); // visible highlight only
+    await page.screenshot({ path: shot('40-reactivation-pulse') });
+    await expect(composer).toBeFocused();
+
+    await page.keyboard.type(' and more');
+    await page.keyboard.press('Meta+Enter');
+    await page.keyboard.press('Control+Enter');
+    await page.waitForTimeout(800);
+    expect((await pendingApprovals(request)).some((a) => a.tool === 'tasks_create')).toBe(true);
+    expect(await listTaskTitles(request)).not.toContain(title);
+    await expect(composer).toBeFocused();
+    await expect(composer).toHaveValue('my draft and more');
+    await denyAll(request);
+    await pending;
+  });
+
+  test('an automatic (non-explicit) focus-approval event never moves focus; an explicit one does, with the guard re-armed', async ({ page, request }) => {
+    await page.goto('/');
+    const composer = page.getByLabel('Message Hermes');
+    await composer.click();
+    const pending = callTool(request, 'tasks_create', { title: `Explicit ${Date.now()}` });
+    const card = page.getByTestId('approval-card');
+    await expect(card).toBeVisible();
+    await page.waitForTimeout(900);
+    await page.evaluate(() => window.dispatchEvent(new Event('workbench:focus-approval')));
+    await page.waitForTimeout(100);
+    await expect(composer).toBeFocused();
+    await page.evaluate(() => window.dispatchEvent(new CustomEvent('workbench:focus-approval', { detail: { explicit: true } })));
+    await expect(card).toBeFocused();
+    await page.keyboard.press('Meta+Enter'); // immediately after the programmatic focus move: inert
+    await page.waitForTimeout(300);
+    expect((await pendingApprovals(request)).length).toBeGreaterThan(0);
+    await denyAll(request);
+    await pending;
   });
 });
