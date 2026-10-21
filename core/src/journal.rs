@@ -230,6 +230,47 @@ pub fn find_by_effect(
     }))
 }
 
+/// Would `undo` succeed right now? A read-only mirror of its conflict checks.
+fn undo_would_apply(conn: &Connection, e: &JournalEntry) -> bool {
+    if e.tool == "undo" || e.undone_at.is_some() {
+        return false;
+    }
+    let Some(inv) = &e.inverse_json else {
+        return false;
+    };
+    match inv["op"].as_str() {
+        Some("delete") | Some("restore") => {
+            let (Some(id), Some(after)) = (inv["id"].as_str(), inv["after_updated_at"].as_str())
+            else {
+                return false;
+            };
+            matches!(tasks::get(conn, id), Ok(Some(t)) if t.updated_at == after)
+        }
+        Some("recreate") => inv["task"]["id"]
+            .as_str()
+            .is_some_and(|id| matches!(tasks::get(conn, id), Ok(None))),
+        _ => false,
+    }
+}
+
+/// Newest entry that has an inverse, is not undone and whose undo would not be
+/// refused as stale.
+pub fn latest_undoable(conn: &Connection) -> ApiResult<Option<JournalEntry>> {
+    let mut st = conn.prepare(&format!(
+        "SELECT {COLS} FROM journal
+         WHERE inverse_json IS NOT NULL AND undone_at IS NULL AND tool != 'undo'
+         ORDER BY rowid DESC"
+    ))?;
+    let rows = st.query_map([], row)?;
+    for r in rows {
+        let e = r?;
+        if undo_would_apply(conn, &e) {
+            return Ok(Some(e));
+        }
+    }
+    Ok(None)
+}
+
 #[derive(Debug)]
 pub struct UndoOutcome {
     pub original: JournalEntry,

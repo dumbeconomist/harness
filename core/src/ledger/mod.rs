@@ -37,6 +37,9 @@ pub struct DayTotal {
 #[derive(Debug, Serialize, PartialEq)]
 pub struct Summary {
     pub total_usd: f64,
+    pub today_usd: f64,
+    pub last7_usd: f64,
+    pub last30_usd: f64,
     pub total_tokens: i64,
     pub unpriced_runs: i64,
     pub by_model: Vec<ModelTotal>,
@@ -103,6 +106,30 @@ pub fn entries(conn: &Connection, limit: usize) -> ApiResult<Vec<LedgerEntry>> {
 }
 
 pub fn summary(conn: &Connection) -> ApiResult<Summary> {
+    summary_at(conn, chrono::Utc::now().date_naive())
+}
+
+/// Spend between `from` and `to` (inclusive UTC days, `YYYY-MM-DD`).
+fn sum_between(conn: &Connection, from: &str, to: &str) -> ApiResult<f64> {
+    Ok(conn.query_row(
+        "SELECT COALESCE(SUM(cost_usd), 0.0) FROM ledger WHERE substr(ts, 1, 10) BETWEEN ?1 AND ?2",
+        params![from, to],
+        |r| r.get(0),
+    )?)
+}
+
+/// `summary` relative to an explicit UTC `today` (so tests are deterministic).
+/// `by_day` always holds exactly the last 14 days ending today, zero days included.
+pub fn summary_at(conn: &Connection, today: chrono::NaiveDate) -> ApiResult<Summary> {
+    let day = |back: u64| {
+        (today - chrono::Days::new(back))
+            .format("%Y-%m-%d")
+            .to_string()
+    };
+    let today_s = day(0);
+    let today_usd = sum_between(conn, &today_s, &today_s)?;
+    let last7_usd = sum_between(conn, &day(6), &today_s)?;
+    let last30_usd = sum_between(conn, &day(29), &today_s)?;
     let total_usd: f64 =
         conn.query_row("SELECT COALESCE(SUM(cost_usd), 0.0) FROM ledger", [], |r| {
             r.get(0)
@@ -123,16 +150,22 @@ pub fn summary(conn: &Connection) -> ApiResult<Summary> {
         })?
         .collect::<Result<Vec<_>, _>>()?;
     let mut st = conn.prepare(
-        "SELECT substr(ts, 1, 10) AS day, SUM(cost_usd) FROM ledger GROUP BY day ORDER BY day",
+        "SELECT substr(ts, 1, 10) AS day, SUM(cost_usd) FROM ledger
+         WHERE day BETWEEN ?1 AND ?2 GROUP BY day",
     )?;
-    let by_day = st
-        .query_map([], |r| {
-            Ok(DayTotal {
-                day: r.get(0)?,
-                usd: r.get(1)?,
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
+    let sums: std::collections::HashMap<String, f64> = st
+        .query_map(params![day(13), today_s], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    let by_day = (0..14u64)
+        .rev()
+        .map(|back| {
+            let d = day(back);
+            DayTotal {
+                usd: sums.get(&d).copied().unwrap_or(0.0),
+                day: d,
+            }
+        })
+        .collect();
     let (total_tokens, unpriced_runs): (i64, i64) = conn.query_row(
         "SELECT COALESCE(SUM(prompt_tokens + completion_tokens), 0),
                 COALESCE(SUM(source = 'unpriced'), 0) FROM ledger",
@@ -141,6 +174,9 @@ pub fn summary(conn: &Connection) -> ApiResult<Summary> {
     )?;
     Ok(Summary {
         total_usd,
+        today_usd,
+        last7_usd,
+        last30_usd,
         total_tokens,
         unpriced_runs,
         by_model,
@@ -178,8 +214,9 @@ mod tests {
         assert!(s.by_model[0].priced && !s.by_model[1].priced);
         assert_eq!(s.by_model[0].model, "claude-sonnet-4");
         assert_eq!(s.by_model[0].tokens, 2_000_000);
-        assert_eq!(s.by_day.len(), 2);
-        assert_eq!(s.by_day[0].day, "2020-01-01");
+        assert_eq!(s.by_day.len(), 14);
+        assert!((s.today_usd - 3.0).abs() < 1e-9);
+        assert!((s.last30_usd - 3.0).abs() < 1e-9);
         assert_eq!(entries(&c, 2).unwrap().len(), 2);
     }
 
@@ -188,6 +225,46 @@ mod tests {
         let db = Db::open_memory().unwrap();
         let s = summary(&db.lock()).unwrap();
         assert_eq!(s.total_usd, 0.0);
-        assert!(s.by_model.is_empty() && s.by_day.is_empty());
+        assert!(s.by_model.is_empty());
+        assert_eq!(s.by_day.len(), 14);
+        assert!(s.by_day.iter().all(|d| d.usd == 0.0));
+    }
+
+    #[test]
+    fn windows_and_zero_fill() {
+        let db = Db::open_memory().unwrap();
+        let c = db.lock();
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 3, 2).unwrap();
+        // Each run costs $3 (1M prompt tokens of claude-sonnet-4).
+        for (run, ts) in [
+            ("a", "2026-03-02T23:59:59.999Z"), // today
+            ("b", "2026-03-01T00:00:00.000Z"), // 1 day ago
+            ("c", "2026-02-24T12:00:00.000Z"), // 6 days ago (last7 edge)
+            ("d", "2026-02-23T12:00:00.000Z"), // 7 days ago
+            ("e", "2026-02-17T12:00:00.000Z"), // 13 days ago (chart edge)
+            ("f", "2026-02-16T12:00:00.000Z"), // 14 days ago (out of chart)
+            ("g", "2026-01-31T12:00:00.000Z"), // 30 days ago (out of last30)
+            ("h", "2026-02-01T12:00:00.000Z"), // 29 days ago (last30 edge)
+        ] {
+            record(&c, run, "claude-sonnet-4", 1_000_000, 0).unwrap();
+            c.execute(
+                "UPDATE ledger SET ts = ?2 WHERE run_id = ?1",
+                params![run, ts],
+            )
+            .unwrap();
+        }
+        let s = summary_at(&c, today).unwrap();
+        assert!((s.total_usd - 24.0).abs() < 1e-9);
+        assert!((s.today_usd - 3.0).abs() < 1e-9);
+        assert!((s.last7_usd - 9.0).abs() < 1e-9);
+        assert!((s.last30_usd - 21.0).abs() < 1e-9);
+        assert_eq!(s.by_day.len(), 14);
+        assert_eq!(s.by_day[0].day, "2026-02-17");
+        assert_eq!(s.by_day[13].day, "2026-03-02");
+        assert!((s.by_day[0].usd - 3.0).abs() < 1e-9);
+        assert_eq!(s.by_day[1].usd, 0.0);
+        assert!((s.by_day[13].usd - 3.0).abs() < 1e-9);
+        let nonzero = s.by_day.iter().filter(|d| d.usd > 0.0).count();
+        assert_eq!(nonzero, 5); // e, d, c, b, a
     }
 }

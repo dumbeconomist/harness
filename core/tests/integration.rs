@@ -1008,8 +1008,10 @@ async fn chat_streams_deltas_and_records_ledger_with_cost() {
     assert_eq!(s["by_model"][0]["priced"], true);
     assert_eq!(s["total_tokens"], 3000);
     assert_eq!(s["unpriced_runs"], 0);
-    assert_eq!(s["by_day"].as_array().unwrap().len(), 1);
-    assert_eq!(s["by_day"][0]["day"].as_str().unwrap().len(), 10);
+    assert_eq!(s["by_day"].as_array().unwrap().len(), 14);
+    assert_eq!(s["by_day"][13]["day"].as_str().unwrap().len(), 10);
+    assert!((s["by_day"][13]["usd"].as_f64().unwrap() - 0.033).abs() < 1e-9);
+    assert!((s["today_usd"].as_f64().unwrap() - 0.033).abs() < 1e-9);
     h.shutdown().await;
 }
 

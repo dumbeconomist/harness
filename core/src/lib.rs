@@ -7,6 +7,7 @@ pub mod approvals;
 pub mod brain;
 pub mod config;
 pub mod db;
+pub mod doctor;
 pub mod error;
 pub mod events;
 pub mod journal;
@@ -16,6 +17,7 @@ pub mod objects;
 pub mod policy;
 pub mod secrets;
 pub mod state;
+pub mod threads;
 pub mod tools;
 
 use std::path::Path;
@@ -150,6 +152,7 @@ pub async fn serve(config: Config) -> anyhow::Result<RunningServer> {
         .with_context(|| format!("binding {}", config.addr))?;
     let addr = listener.local_addr()?;
 
+    let doctor = doctor::Doctor::load(&db);
     let (flag_tx, flag_rx) = watch::channel(false);
     let approvals_handle = approvals.clone();
     let state = Arc::new(state::AppState {
@@ -165,6 +168,7 @@ pub async fn serve(config: Config) -> anyhow::Result<RunningServer> {
         hermes_model,
         inflight: Default::default(),
         http: reqwest::Client::new(),
+        doctor,
         shutdown: flag_rx,
     });
     let app = api::router(state);

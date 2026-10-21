@@ -23,6 +23,7 @@ use crate::brain;
 use crate::brain::{BrainEvent, ChatMessage, ChatRequest};
 use crate::db;
 use crate::db::new_id;
+use crate::doctor;
 use crate::error::{ApiError, ApiResult};
 use crate::journal;
 use crate::ledger;
@@ -32,6 +33,7 @@ use crate::policy;
 use crate::secrets;
 use crate::state::HermesRuntime;
 use crate::state::SharedState;
+use crate::threads;
 use crate::tools;
 use std::sync::Arc;
 
@@ -133,6 +135,7 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/approvals", get(list_approvals))
         .route("/api/approvals/:id/decision", post(decide_approval))
         .route("/api/journal", get(list_journal))
+        .route("/api/journal/latest-undoable", get(latest_undoable))
         .route("/api/journal/:id/undo", post(undo_journal))
         .route("/api/ledger/summary", get(ledger_summary))
         .route("/api/ledger/entries", get(ledger_entries))
@@ -146,6 +149,10 @@ pub fn router(state: SharedState) -> Router {
         )
         .route("/api/settings/hermes", get(get_hermes).put(put_hermes))
         .route("/api/settings/connection", get(get_connection))
+        .route("/api/doctor", get(get_doctor))
+        .route("/api/threads", get(list_threads).post(create_thread))
+        .route("/api/threads/:id", axum::routing::delete(delete_thread))
+        .route("/api/threads/:id/messages", get(thread_messages))
         .route("/api/chat", post(chat))
         .route("/api/events", get(events))
         .route(
@@ -182,13 +189,21 @@ pub fn router(state: SharedState) -> Router {
 // ----------------------------------------------------------------- health
 
 /// Any HTTP answer (even 401) from `{url}/models` means Hermes is up.
+/// The outcome is also recorded for the doctor (brain ok / error).
 async fn probe_hermes(st: &SharedState, h: &HermesRuntime) -> bool {
-    let url = format!("{}/models", h.url.trim_end_matches('/'));
-    let mut rb = st.http.get(url).timeout(Duration::from_millis(1500));
-    if let Some(k) = &h.api_key {
-        rb = rb.bearer_auth(k);
-    }
-    rb.send().await.is_ok()
+    doctor::probe_models(st, h, Duration::from_millis(1500))
+        .await
+        .is_ok()
+}
+
+// ----------------------------------------------------------------- doctor
+
+async fn get_doctor(
+    State(st): State<SharedState>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Json<doctor::Report> {
+    let deep = matches!(q.get("deep").map(String::as_str), Some("1" | "true"));
+    Json(doctor::run(&st, deep).await)
 }
 
 async fn health(State(st): State<SharedState>) -> Json<Value> {
@@ -427,6 +442,12 @@ async fn list_journal(
     Ok(Json(st.db.with(|c| journal::list(c, limit))?))
 }
 
+async fn latest_undoable(
+    State(st): State<SharedState>,
+) -> ApiResult<Json<Option<journal::JournalEntry>>> {
+    Ok(Json(st.db.with(journal::latest_undoable)?))
+}
+
 async fn undo_journal(
     State(st): State<SharedState>,
     Path(id): Path<String>,
@@ -503,6 +524,59 @@ async fn events(
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
+// ---------------------------------------------------------------- threads
+
+async fn list_threads(
+    State(st): State<SharedState>,
+    Query(q): Query<HashMap<String, String>>,
+) -> ApiResult<Json<Vec<threads::Thread>>> {
+    let (k, i) = (q.get("context_kind"), q.get("context_id"));
+    Ok(Json(st.db.with(|c| {
+        threads::list(c, k.map(String::as_str), i.map(String::as_str))
+    })?))
+}
+
+#[derive(Deserialize)]
+struct ThreadBody {
+    context_kind: Option<String>,
+    context_id: Option<String>,
+    title: Option<String>,
+}
+
+async fn create_thread(
+    State(st): State<SharedState>,
+    ApiJson(body): ApiJson<ThreadBody>,
+) -> ApiResult<Json<threads::Thread>> {
+    Ok(Json(st.db.with(|c| {
+        threads::create(
+            c,
+            body.context_kind.as_deref(),
+            body.context_id.as_deref(),
+            body.title.as_deref(),
+        )
+    })?))
+}
+
+async fn thread_messages(
+    State(st): State<SharedState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Vec<threads::Message>>> {
+    st.db.with(|c| {
+        if threads::get(c, &id)?.is_none() {
+            return Err(ApiError::not_found(format!("thread '{id}' not found")));
+        }
+        Ok(Json(threads::messages(c, &id)?))
+    })
+}
+
+async fn delete_thread(
+    State(st): State<SharedState>,
+    Path(id): Path<String>,
+) -> ApiResult<StatusCode> {
+    st.db.with(|c| threads::delete(c, &id))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 // ------------------------------------------------------------------- chat
 
 #[derive(Deserialize)]
@@ -510,6 +584,7 @@ struct ChatBody {
     messages: Vec<ChatMessage>,
     context: Option<ChatContext>,
     session_id: Option<String>,
+    thread_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -520,6 +595,22 @@ struct ChatContext {
 
 fn sse_json(name: &str, v: Value) -> Result<SseEvent, Infallible> {
     Ok(SseEvent::default().event(name).data(v.to_string()))
+}
+
+/// Tool chips for a thread: a `running` chip is updated in place when the same
+/// tool reports a later status, otherwise each report is a new chip.
+fn track_tool(chips: &mut Vec<(String, String)>, tool: &str, status: &str) {
+    if status != "running" {
+        if let Some(c) = chips
+            .iter_mut()
+            .rev()
+            .find(|(t, s)| t == tool && s == "running")
+        {
+            c.1 = status.to_string();
+            return;
+        }
+    }
+    chips.push((tool.to_string(), status.to_string()));
 }
 
 async fn chat(
@@ -534,10 +625,45 @@ async fn chat(
             return Err(ApiError::bad_request(format!("invalid role '{}'", m.role)));
         }
     }
+    let thread_id = body.thread_id.clone();
+    let mut context = body.context.map(|c| (c.kind, c.id));
     let mut messages = body.messages;
-    if let Some(ctx) = &body.context {
-        if ctx.kind == "task" {
-            if let Some(t) = st.db.with(|c| tasks::get(c, &ctx.id))? {
+    let mut session_id = body.session_id;
+
+    if let Some(tid) = &thread_id {
+        // History comes from the DB; only the last user message of the body counts.
+        let Some(last_user) = messages.iter().rev().find(|m| m.role == "user").cloned() else {
+            return Err(ApiError::bad_request(
+                "messages must contain a user message when thread_id is set",
+            ));
+        };
+        let history = st.db.with(|c| {
+            let Some(t) = threads::get(c, tid)? else {
+                return Err(ApiError::not_found(format!("thread '{tid}' not found")));
+            };
+            if context.is_none() {
+                if let (Some(k), Some(i)) = (t.context_kind, t.context_id) {
+                    context = Some((k, i));
+                }
+            }
+            threads::add_message(c, tid, "user", &last_user.content, None)?;
+            threads::auto_title(c, tid, &last_user.content)?;
+            threads::messages(c, tid)
+        })?;
+        messages = history
+            .into_iter()
+            .filter(|m| m.role == "user" || m.role == "assistant")
+            .map(|m| ChatMessage {
+                role: m.role,
+                content: m.content,
+            })
+            .collect();
+        session_id = Some(tid.clone());
+    }
+
+    if let Some((kind, id)) = &context {
+        if kind == "task" {
+            if let Some(t) = st.db.with(|c| tasks::get(c, id))? {
                 messages.insert(
                     0,
                     ChatMessage {
@@ -555,24 +681,60 @@ async fn chat(
     let mut upstream = st.brain().chat_stream(ChatRequest {
         messages,
         model: None,
-        session_id: body.session_id,
+        session_id,
     });
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<SseEvent, Infallible>>(64);
     let run_id = new_id();
     tokio::spawn(async move {
+        let mut text = String::new();
+        let mut chips: Vec<(String, String)> = Vec::new();
         while let Some(ev) = upstream.next().await {
             let out = match ev {
-                BrainEvent::Delta(text) => sse_json("delta", json!({"text": text})),
+                BrainEvent::Delta(t) => {
+                    text.push_str(&t);
+                    sse_json("delta", json!({"text": t}))
+                }
                 BrainEvent::ToolProgress { tool, status } => {
+                    track_tool(&mut chips, &tool, &status);
                     sse_json("tool", json!({"tool": tool, "status": status}))
                 }
                 BrainEvent::Error(message) => {
+                    let h = st.hermes();
+                    let shown = h
+                        .api_key
+                        .as_deref()
+                        .filter(|k| k.len() >= 4)
+                        .map_or(message.clone(), |k| message.replace(k, "***"));
+                    st.doctor
+                        .brain_error(&st.db, doctor::status_from_message(&shown), &shown);
                     let _ = tx
                         .send(sse_json("error", json!({"message": message})))
                         .await;
                     break;
                 }
                 BrainEvent::Done { usage, model } => {
+                    st.doctor.brain_ok(&st.db);
+                    if let Some(tid) = &thread_id {
+                        let saved = st.db.with(|c| {
+                            for (tool, status) in &chips {
+                                threads::add_message(
+                                    c,
+                                    tid,
+                                    "tool",
+                                    tool,
+                                    Some(&json!({"tool": tool, "status": status})),
+                                )?;
+                            }
+                            if !text.is_empty() {
+                                threads::add_message(c, tid, "assistant", &text, None)?;
+                            }
+                            Ok(())
+                        });
+                        if let Err(e) = saved {
+                            // Thread deleted mid-stream, or a DB error: the answer was still streamed.
+                            tracing::warn!("could not persist assistant message: {}", e.message);
+                        }
+                    }
                     let rec = st.db.with(|c| {
                         ledger::record(
                             c,

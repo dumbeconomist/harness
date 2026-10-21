@@ -60,6 +60,26 @@ CREATE TABLE settings(
 );
 "#,
     "ALTER TABLE journal ADD COLUMN args_hash TEXT;",
+    r#"
+CREATE TABLE threads(
+  id TEXT PRIMARY KEY,
+  context_kind TEXT,
+  context_id TEXT,
+  title TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX threads_context ON threads(context_kind, context_id);
+CREATE TABLE messages(
+  id TEXT PRIMARY KEY,
+  thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+  role TEXT NOT NULL CHECK (role IN ('user','assistant','tool')),
+  content TEXT NOT NULL,
+  tool_json TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX messages_thread ON messages(thread_id);
+"#,
 ];
 
 #[derive(Clone)]

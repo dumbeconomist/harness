@@ -9,6 +9,7 @@ use crate::approvals::Approvals;
 use crate::brain::Brain;
 use crate::config::Config;
 use crate::db::Db;
+use crate::doctor::Doctor;
 use crate::events::Events;
 
 /// Live Hermes connection settings (hot-swappable).
@@ -36,6 +37,8 @@ pub struct AppState {
     /// concurrent identical calls share one card.
     pub inflight: std::sync::Mutex<std::collections::HashMap<String, String>>,
     pub http: reqwest::Client,
+    /// Connection-doctor bookkeeping (MCP/brain last-seen times).
+    pub doctor: Doctor,
     /// Flips to `true` on shutdown so long-lived SSE streams can end.
     pub shutdown: watch::Receiver<bool>,
 }

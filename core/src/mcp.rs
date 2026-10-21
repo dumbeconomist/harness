@@ -103,6 +103,7 @@ pub async fn handle_message(state: &SharedState, msg: Value) -> Option<Value> {
 
     Some(match method {
         "initialize" => {
+            state.doctor.mcp_initialize(&state.db, &params);
             let requested = params.get("protocolVersion").and_then(Value::as_str);
             let version = negotiate_version(requested);
             rpc_result(
@@ -116,8 +117,12 @@ pub async fn handle_message(state: &SharedState, msg: Value) -> Option<Value> {
             )
         }
         "ping" => rpc_result(id, json!({})),
-        "tools/list" => rpc_result(id, tools_list()),
+        "tools/list" => {
+            state.doctor.mcp_tools_list(&state.db);
+            rpc_result(id, tools_list())
+        }
         "tools/call" => {
+            state.doctor.mcp_tool_call(&state.db);
             let Some(name) = params.get("name").and_then(Value::as_str) else {
                 return Some(rpc_error(id, INVALID_PARAMS, "params.name is required"));
             };
