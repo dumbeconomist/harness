@@ -508,3 +508,154 @@ describe("mock-hermes agent loop (add a task)", () => {
     }
   });
 });
+
+// --- Toolsets: GET /v1/toolsets (used by the Doctor's profile_locked check) --
+
+const DEFAULT_TOOLSETS = [
+  { name: "terminal", enabled: false },
+  { name: "file", enabled: false },
+  { name: "web", enabled: true },
+];
+
+// Runs fn with the given env vars set (undefined deletes), restoring the previous values after.
+async function withEnv(vars, fn) {
+  const saved = {};
+  for (const name of Object.keys(vars)) {
+    saved[name] = process.env[name];
+    if (vars[name] === undefined) delete process.env[name];
+    else process.env[name] = vars[name];
+  }
+  try {
+    return await fn();
+  } finally {
+    for (const name of Object.keys(saved)) {
+      if (saved[name] === undefined) delete process.env[name];
+      else process.env[name] = saved[name];
+    }
+  }
+}
+
+describe("mock-hermes toolsets", () => {
+  test("default: terminal and file disabled, web enabled", async () => {
+    await withEnv({ MOCK_HERMES_UNLOCKED: undefined, MOCK_HERMES_NO_TOOLSETS: undefined }, async () => {
+      const ctx = await startServer({ key: "" });
+      try {
+        const res = await fetch(`${ctx.base}/v1/toolsets`);
+        assert.equal(res.status, 200);
+        assert.match(res.headers.get("content-type"), /application\/json/);
+        assert.deepEqual(await res.json(), DEFAULT_TOOLSETS);
+      } finally {
+        await new Promise((resolve) => ctx.server.close(resolve));
+      }
+    });
+  });
+
+  test("unlocked option: terminal and file enabled", async () => {
+    const ctx = await startServer({ key: "", unlocked: true });
+    try {
+      const res = await fetch(`${ctx.base}/v1/toolsets`);
+      assert.deepEqual(await res.json(), [
+        { name: "terminal", enabled: true },
+        { name: "file", enabled: true },
+        { name: "web", enabled: true },
+      ]);
+    } finally {
+      await new Promise((resolve) => ctx.server.close(resolve));
+    }
+  });
+
+  test("MOCK_HERMES_UNLOCKED=1 enables terminal and file", async () => {
+    await withEnv({ MOCK_HERMES_UNLOCKED: "1", MOCK_HERMES_NO_TOOLSETS: undefined }, async () => {
+      const ctx = await startServer({ key: "" });
+      try {
+        const body = await (await fetch(`${ctx.base}/v1/toolsets`)).json();
+        assert.deepEqual(body.map((t) => t.enabled), [true, true, true]);
+      } finally {
+        await new Promise((resolve) => ctx.server.close(resolve));
+      }
+    });
+  });
+
+  test("noToolsets option: GET /v1/toolsets returns 404", async () => {
+    const ctx = await startServer({ key: "", noToolsets: true });
+    try {
+      const res = await fetch(`${ctx.base}/v1/toolsets`);
+      assert.equal(res.status, 404);
+      assert.equal((await res.json()).error.type, "not_found");
+      // Other routes are unaffected.
+      assert.equal((await fetch(`${ctx.base}/v1/models`)).status, 200);
+    } finally {
+      await new Promise((resolve) => ctx.server.close(resolve));
+    }
+  });
+
+  test("MOCK_HERMES_NO_TOOLSETS=1 makes GET /v1/toolsets return 404", async () => {
+    await withEnv({ MOCK_HERMES_NO_TOOLSETS: "1", MOCK_HERMES_UNLOCKED: undefined }, async () => {
+      const ctx = await startServer({ key: "" });
+      try {
+        assert.equal((await fetch(`${ctx.base}/v1/toolsets`)).status, 404);
+      } finally {
+        await new Promise((resolve) => ctx.server.close(resolve));
+      }
+    });
+  });
+
+  test("/v1/toolsets without a bearer header returns 401 when a key is set", async () => {
+    const ctx = await startServer({ key: "tools-key" });
+    try {
+      const res = await fetch(`${ctx.base}/v1/toolsets`);
+      assert.equal(res.status, 401);
+      assert.equal((await res.json()).error.type, "authentication_error");
+    } finally {
+      await new Promise((resolve) => ctx.server.close(resolve));
+    }
+  });
+
+  test("/v1/toolsets with a wrong bearer key returns 401; the right key returns the list", async () => {
+    const ctx = await startServer({ key: "tools-key" });
+    try {
+      const wrong = await fetch(`${ctx.base}/v1/toolsets`, {
+        headers: { Authorization: "Bearer nope" },
+      });
+      assert.equal(wrong.status, 401);
+      const right = await fetch(`${ctx.base}/v1/toolsets`, {
+        headers: { Authorization: "Bearer tools-key" },
+      });
+      assert.equal(right.status, 200);
+      assert.deepEqual(await right.json(), DEFAULT_TOOLSETS);
+    } finally {
+      await new Promise((resolve) => ctx.server.close(resolve));
+    }
+  });
+
+  test("non-stream chat with max_tokens:1 still returns a chat.completion (doctor deep check)", async () => {
+    const ctx = await startServer({ key: "" });
+    try {
+      const res = await fetch(`${ctx.base}/v1/chat/completions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ max_tokens: 1, messages: [{ role: "user", content: "ping" }] }),
+      });
+      assert.equal(res.status, 200);
+      const body = await res.json();
+      assert.equal(body.object, "chat.completion");
+      assert.equal(body.choices[0].message.content, `${REPLY_PREFIX} ping`);
+    } finally {
+      await new Promise((resolve) => ctx.server.close(resolve));
+    }
+  });
+
+  test("__error__ still returns 500 with max_tokens:1 (non-stream)", async () => {
+    const ctx = await startServer({ key: "" });
+    try {
+      const res = await fetch(`${ctx.base}/v1/chat/completions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ max_tokens: 1, messages: [{ role: "user", content: "__error__" }] }),
+      });
+      assert.equal(res.status, 500);
+    } finally {
+      await new Promise((resolve) => ctx.server.close(resolve));
+    }
+  });
+});

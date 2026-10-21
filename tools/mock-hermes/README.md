@@ -18,6 +18,7 @@ Listens on `127.0.0.1` only. Default port `8642`.
 |---|---|
 | `GET /health` | always open, returns `{"status":"ok"}` |
 | `GET /v1/models` | lists `hermes-agent` |
+| `GET /v1/toolsets` | JSON array of `{name, enabled}`: `terminal` and `file` disabled, `web` enabled. `MOCK_HERMES_UNLOCKED=1` (or `start(..., {unlocked: true})`) enables `terminal` and `file`. `MOCK_HERMES_NO_TOOLSETS=1` (or `{noToolsets: true}`) makes it return `404`. Needs the bearer key like other `/v1/*` routes |
 | `POST /v1/chat/completions` | `stream: true` gives SSE word chunks, optional `stream_options.include_usage` usage chunk, then `[DONE]`. Otherwise a `chat.completion` JSON |
 
 The reply is deterministic: `Mock Hermes heard: <last user message>`. Usage counts are word counts.
@@ -28,6 +29,15 @@ Matched in the last user message:
 
 - `__error__`: HTTP 500 JSON error (before any streaming starts)
 - `__slow__`: 200 ms delay per streamed chunk (default 10 ms)
+
+## Toolsets and the Doctor
+
+`GET /v1/toolsets` is what the Doctor's `profile_locked` check reads. The default profile is locked
+(`terminal` and `file` disabled). Use `MOCK_HERMES_UNLOCKED=1` to get a profile the check fails on, and
+`MOCK_HERMES_NO_TOOLSETS=1` to get a Hermes without the endpoint, where the check can only warn.
+
+The Doctor's deep check (`hermes_model`) sends a non-stream `max_tokens: 1` request. The mock ignores
+`max_tokens` and returns the normal reply. `__error__` still gives a 500 for that request.
 
 ## Agent loop: "add a task"
 
@@ -65,7 +75,7 @@ otherwise `401`. Header values are never logged. Each request logs one line:
 node --test tools/mock-hermes/server.test.js
 ```
 
-The suite includes an in-process fake MCP server for the agent loop.
+The suite includes an in-process fake MCP server for the agent loop. It also covers `/v1/toolsets` (default, unlocked by option and env, 404, 401) and the `max_tokens: 1` deep check.
 
 Note: `node --test tools/mock-hermes/` (a directory) runs zero tests on Node 22. Pass the file
 path, or run `pnpm test` from inside this directory.

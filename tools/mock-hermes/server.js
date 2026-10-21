@@ -7,6 +7,8 @@
 //   MOCK_HERMES_MCP_URL + MOCK_HERMES_MCP_TOKEN
 //                     if both set, streamed "add a task" requests call the
 //                     Workbench MCP tasks_create tool (agent loop, see README)
+//   MOCK_HERMES_UNLOCKED=1   /v1/toolsets reports terminal and file as enabled
+//   MOCK_HERMES_NO_TOOLSETS=1  /v1/toolsets returns 404 (older Hermes without it)
 //
 // Test triggers (matched in the last user message):
 //   __error__  -> HTTP 500 JSON error
@@ -258,7 +260,17 @@ async function handleChat(req, res, body, mcp) {
   res.end();
 }
 
-function route(req, res, pathname, key, mcp) {
+// Toolsets as the profile reports them. The locked profile (default) disables Hermes's own
+// terminal and file tools; "unlocked" enables them, which the Doctor's profile_locked check flags.
+function toolsetList(unlocked) {
+  return [
+    { name: "terminal", enabled: unlocked },
+    { name: "file", enabled: unlocked },
+    { name: "web", enabled: true },
+  ];
+}
+
+function route(req, res, pathname, key, mcp, toolsets) {
   if (req.method === "GET" && pathname === "/health") {
     return sendJson(res, 200, { status: "ok" });
   }
@@ -272,6 +284,10 @@ function route(req, res, pathname, key, mcp) {
       object: "list",
       data: [{ id: MODEL_ID, object: "model", owned_by: "hermes" }],
     });
+  }
+
+  if (req.method === "GET" && pathname === "/v1/toolsets" && !toolsets.noToolsets) {
+    return sendJson(res, 200, toolsetList(toolsets.unlocked));
   }
 
   if (req.method === "POST" && pathname === "/v1/chat/completions") {
@@ -297,12 +313,14 @@ function route(req, res, pathname, key, mcp) {
  * Listening is asynchronous: wait for the server's 'listening' event.
  *
  * @param {number} [port] port to listen on; 0 picks a free port
- * @param {{ key?: string, log?: (line: string) => void, mcpUrl?: string | null, mcpToken?: string | null }} [options]
+ * @param {{ key?: string, log?: (line: string) => void, mcpUrl?: string | null, mcpToken?: string | null, unlocked?: boolean, noToolsets?: boolean }} [options]
  *   key: bearer key to enforce on /v1/* (defaults to MOCK_HERMES_KEY)
  *   log: sink for request log lines (defaults to console.log)
  *   mcpUrl / mcpToken: Workbench MCP endpoint and bearer token for the "add a task" agent loop
  *     (default to MOCK_HERMES_MCP_URL / MOCK_HERMES_MCP_TOKEN; the loop is off unless both are set;
  *     pass null to disable explicitly)
+ *   unlocked: report terminal and file toolsets as enabled (default: MOCK_HERMES_UNLOCKED === "1")
+ *   noToolsets: make GET /v1/toolsets return 404 (default: MOCK_HERMES_NO_TOOLSETS === "1")
  * @returns {http.Server}
  */
 export function start(port = defaultPort(), options = {}) {
@@ -311,6 +329,10 @@ export function start(port = defaultPort(), options = {}) {
   const mcpUrl = "mcpUrl" in options ? options.mcpUrl : process.env.MOCK_HERMES_MCP_URL;
   const mcpToken = "mcpToken" in options ? options.mcpToken : process.env.MOCK_HERMES_MCP_TOKEN;
   const mcp = mcpUrl && mcpToken ? { url: mcpUrl, token: mcpToken } : null;
+  const toolsets = {
+    unlocked: options.unlocked ?? process.env.MOCK_HERMES_UNLOCKED === "1",
+    noToolsets: options.noToolsets ?? process.env.MOCK_HERMES_NO_TOOLSETS === "1",
+  };
 
   const server = http.createServer((req, res) => {
     const pathname = (req.url ?? "/").split("?")[0];
@@ -318,7 +340,7 @@ export function start(port = defaultPort(), options = {}) {
       // Never log headers: Authorization must not reach stdout.
       log(`${req.method} ${pathname} ${res.statusCode}`);
     });
-    route(req, res, pathname, key || null, mcp);
+    route(req, res, pathname, key || null, mcp, toolsets);
   });
 
   server.listen(port, "127.0.0.1");
