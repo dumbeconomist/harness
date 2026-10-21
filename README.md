@@ -84,6 +84,20 @@ Background and evidence: [`docs/hermes-integration.md` §9](docs/hermes-integrat
 5. **Try it:** select a task, then in the Hermes pane type *"add a task to buy milk"*. An approval card
    appears; approve it, then undo it from **Activity**.
 
+### Everyday use
+
+- **⌥Space** opens the quick bar from anywhere, even while Workbench is hidden in the menu bar. Type a
+  question for Hermes, or a command: `/task <title>`, `/ask <question>`, `/find <text>`,
+  `/goto <tasks|approvals|activity|ledger|settings>`, `/undo` (shows what will be undone; you confirm),
+  `/status`. **⌘K** opens the same commands inside the main window.
+- **Approvals.** When Hermes wants to change something, an approval card appears in the Hermes pane.
+  While Workbench is hidden you get a macOS notification and a count on the menu-bar icon. Nothing outside
+  the card itself can approve or deny: not the quick bar, not ⌘K, not a notification.
+- **Connection doctor** (Settings): checks the Hermes API, the API key, the model, whether Hermes has
+  connected to Workbench and seen its tools, and whether the Hermes profile is locked. Each problem has a
+  one-line fix. If something is wrong, the sidebar shows a "Connection" warning until it's resolved.
+- **Chats are kept per task.** Pick a task and the Hermes pane shows that task's threads.
+
 ### Web UI dev loop (without the app shell)
 
 ```sh
