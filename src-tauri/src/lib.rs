@@ -3,7 +3,13 @@
 //! Responsibilities: window, tray, global shortcut, Keychain, start/stop core in-process,
 //! inject `window.__WORKBENCH__ = {baseUrl, token}` before the web app loads.
 
-use std::sync::Mutex;
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicI32, Ordering},
+        Mutex,
+    },
+};
 
 use tauri::{
     menu::{Menu, MenuItem},
@@ -21,6 +27,15 @@ struct CoreHandle(Mutex<Option<workbench_core::RunningServer>>);
 
 /// Tray icon kept in managed state so `native_set_badge` can update its tooltip/title.
 struct TrayHandle(TrayIcon);
+
+/// notification id -> approval id, plus the most recently notified approval (fallback when the
+/// plugin's `ActionPerformed` carries no readable notification).
+#[derive(Default)]
+struct NotifyMap {
+    next_id: AtomicI32,
+    by_id: Mutex<HashMap<i32, String>>,
+    last: Mutex<Option<String>>,
+}
 
 /// JS injected into every window (after `window.__WORKBENCH__`). Calls the commands below through
 /// `__TAURI_INTERNALS__`; camelCase keys (`approvalId`) map to snake_case Rust params (`approval_id`).
@@ -88,14 +103,19 @@ fn show_main_window(app: &AppHandle) {
     }
 }
 
-const FOCUS_APPROVAL_JS: &str =
-    "window.dispatchEvent(new CustomEvent('workbench:focus-approval', {detail:{explicit:true}}))";
-
-/// Show+focus main and ask the web app to focus the approval (explicit user intent).
-fn open_main_focus_approval(app: &AppHandle) {
+/// Show+focus main and ask the web app to focus an approval (explicit user intent).
+/// `approval_id` None focuses whichever card the web app picks.
+fn open_main_focus_approval(app: &AppHandle, approval_id: Option<&str>) {
     show_main_window(app);
     if let Some(w) = app.get_webview_window("main") {
-        let _ = w.eval(FOCUS_APPROVAL_JS);
+        let detail = match approval_id {
+            Some(id) => serde_json::json!({ "explicit": true, "approvalId": id }),
+            None => serde_json::json!({ "explicit": true }),
+        };
+        let _ = w.eval(format!(
+            "window.dispatchEvent(new CustomEvent('workbench:focus-approval', {{detail:{}}}))",
+            detail
+        ));
     }
 }
 
@@ -136,9 +156,21 @@ fn toggle_quick_window(app: &AppHandle) {
 
 #[tauri::command]
 fn native_notify(app: AppHandle, title: String, body: String, approval_id: Option<String>) {
-    // approval_id is accepted for the contract; clicking a desktop notification just activates the app.
-    let _ = approval_id;
-    if let Err(e) = app.notification().builder().title(title).body(body).show() {
+    let mut builder = app.notification().builder().title(title).body(body);
+    if let (Some(approval), Some(map)) = (approval_id, app.try_state::<NotifyMap>()) {
+        let id = map.next_id.fetch_add(1, Ordering::Relaxed).wrapping_add(1).max(1);
+        if let Ok(mut m) = map.by_id.lock() {
+            if m.len() > 200 {
+                m.clear();
+            }
+            m.insert(id, approval.clone());
+        }
+        if let Ok(mut l) = map.last.lock() {
+            *l = Some(approval);
+        }
+        builder = builder.id(id);
+    }
+    if let Err(e) = builder.show() {
         eprintln!("workbench: notification failed: {e}");
     }
 }
@@ -162,9 +194,9 @@ fn native_set_badge(app: AppHandle, count: u32) {
 }
 
 #[tauri::command]
-fn open_main(app: AppHandle, focus_approval: bool) {
+fn open_main(app: AppHandle, focus_approval: bool, approval_id: Option<String>) {
     if focus_approval {
-        open_main_focus_approval(&app);
+        open_main_focus_approval(&app, approval_id.as_deref());
     } else {
         show_main_window(&app);
     }
@@ -237,6 +269,7 @@ pub fn run() {
                 serde_json::json!({ "baseUrl": base_url, "token": server.token }),
                 NATIVE_INIT
             );
+            app.manage(NotifyMap::default());
             app.manage(CoreHandle(Mutex::new(Some(server))));
 
             // --- main window, created programmatically so the init script runs before the app
@@ -271,7 +304,13 @@ pub fn run() {
                 let handle = app.handle().clone();
                 app.notification().on_action(move |performed| {
                     if performed.action_id() == "tap" {
-                        open_main_focus_approval(&handle);
+                        let approval = handle.try_state::<NotifyMap>().and_then(|map| {
+                            performed
+                                .notification()
+                                .and_then(|n| map.by_id.lock().ok()?.get(&n.id()).cloned())
+                                .or_else(|| map.last.lock().ok()?.clone())
+                        });
+                        open_main_focus_approval(&handle, approval.as_deref());
                     }
                 })?;
             }
