@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import type { WorkbenchConfig } from '../../lib/config';
+import { timeAgo } from '../../lib/format';
 import { streamChat, type ToolStatus } from '../../lib/sse';
-import { displayToolName, type ChatContext } from '../../lib/types';
+import { displayToolName, parseJsonish, type ChatContext, type Thread, type ThreadMessage } from '../../lib/types';
+import type { Api } from '../../lib/api';
 
-interface Msg {
+export interface Msg {
   id: number;
   role: 'user' | 'assistant';
   content: string;
@@ -14,6 +16,7 @@ interface Msg {
 }
 
 interface Props {
+  api: Pick<Api, 'listThreads' | 'createThread' | 'threadMessages'>;
   cfg: WorkbenchConfig;
   context: ChatContext | null;
   contextLabel: string;
@@ -25,79 +28,203 @@ interface Props {
 
 let nextId = 1;
 const NO_MESSAGES: Msg[] = [];
+const NEW_THREAD = '__new__';
 
-export function ChatPane({ cfg, context, contextLabel, hidden, onOpenSettings, onClose, slot }: Props) {
-  const key = context ? `${context.kind}:${context.id}` : 'general';
+/** Threads are per context: a task id, or "general". */
+export function contextOf(context: ChatContext | null): { kind: string; id: string; key: string } {
+  return context ? { kind: context.kind, id: context.id, key: `${context.kind}:${context.id}` } : { kind: 'general', id: 'general', key: 'general:general' };
+}
+
+function toolChip(r: ThreadMessage): { name: string; status: ToolStatus } {
+  const j = parseJsonish(r.tool_json);
+  const name = typeof j?.tool === 'string' ? j.tool : typeof j?.name === 'string' ? j.name : r.content || 'tool';
+  const st = j?.status;
+  return { name, status: st === 'running' || st === 'completed' || st === 'failed' ? st : 'completed' };
+}
+
+/** Persisted rows (oldest first) → chat messages; tool rows become chips on the assistant reply they belong to. */
+export function threadToMsgs(rows: ThreadMessage[]): Msg[] {
+  const out: Msg[] = [];
+  let tools: { name: string; status: ToolStatus }[] = [];
+  const flushToLastAssistant = () => {
+    const last = out[out.length - 1];
+    if (tools.length && last && last.role === 'assistant') last.tools = [...(last.tools ?? []), ...tools];
+    tools = [];
+  };
+  for (const r of rows) {
+    if (r.role === 'tool') tools.push(toolChip(r));
+    else if (r.role === 'assistant') {
+      out.push({ id: nextId++, role: 'assistant', content: r.content, ...(tools.length ? { tools } : {}) });
+      tools = [];
+    } else {
+      flushToLastAssistant();
+      out.push({ id: nextId++, role: 'user', content: r.content });
+    }
+  }
+  flushToLastAssistant();
+  return out;
+}
+
+export function ChatPane({ api, cfg, context, contextLabel, hidden, onOpenSettings, onClose, slot }: Props) {
+  const ctx = contextOf(context);
+  const key = ctx.key;
+  const [threads, setThreads] = useState<Record<string, Thread[]>>({});
+  /** undefined = threads not loaded yet, null = a new (not yet created) thread, string = thread id */
+  const [active, setActive] = useState<Record<string, string | null>>({});
   const [chats, setChats] = useState<Record<string, Msg[]>>({});
   const [draft, setDraft] = useState('');
   const [busyKeys, setBusyKeys] = useState<Record<string, boolean>>({});
+  const [notice, setNotice] = useState<string | null>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const logRef = useRef<HTMLDivElement>(null);
   const aborts = useRef<Record<string, AbortController>>({});
-  const sessions = useRef<Record<string, string>>({});
-  const current = chats[key];
+  const requested = useRef<Set<string>>(new Set());
+  const activeId = active[key];
+  const current = activeId ? chats[activeId] : undefined;
   const messages = current ?? NO_MESSAGES;
   const busy = !!busyKeys[key];
+  const threadList = threads[key] ?? [];
 
   useEffect(() => {
     const focus = () => inputRef.current?.focus();
+    const prefill = (e: Event) => {
+      const text = (e as CustomEvent<string>).detail;
+      if (typeof text === 'string' && text) setDraft(text);
+      focus();
+    };
     window.addEventListener('workbench:focus-chat', focus);
+    window.addEventListener('workbench:prefill-chat', prefill);
     const ctl = aborts.current;
     return () => {
       window.removeEventListener('workbench:focus-chat', focus);
+      window.removeEventListener('workbench:prefill-chat', prefill);
       Object.values(ctl).forEach((a) => a.abort());
     };
   }, []);
+
+  // Load this context's threads; open the newest one.
+  useEffect(() => {
+    const reqKey = `threads:${key}`;
+    if (requested.current.has(reqKey)) return;
+    requested.current.add(reqKey);
+    let live = true;
+    api
+      .listThreads(ctx.kind, ctx.id)
+      .then((list) => {
+        if (!live) return;
+        setThreads((t) => {
+          const have = t[key] ?? [];
+          const extra = have.filter((h) => !list.some((l) => l.id === h.id)); // created while this was loading
+          return { ...t, [key]: [...extra, ...list] };
+        });
+        setActive((a) => (a[key] === undefined ? { ...a, [key]: list[0]?.id ?? null } : a));
+      })
+      .catch(() => {
+        requested.current.delete(reqKey);
+        if (!live) return;
+        setThreads((t) => ({ ...t, [key]: [] }));
+        setActive((a) => (a[key] === undefined ? { ...a, [key]: null } : a));
+      });
+    return () => {
+      live = false;
+    };
+  }, [api, key, ctx.kind, ctx.id]);
+
+  // Load the active thread's history once (cached afterwards so in-flight streams are not clobbered).
+  useEffect(() => {
+    const id = activeId;
+    if (!id || id.startsWith('local:') || chats[id] !== undefined) return;
+    const reqKey = `msgs:${id}`;
+    if (requested.current.has(reqKey)) return;
+    requested.current.add(reqKey);
+    api
+      .threadMessages(id)
+      .then((rows) => setChats((c) => (c[id] !== undefined ? c : { ...c, [id]: threadToMsgs(rows) })))
+      .catch((e) => {
+        requested.current.delete(reqKey);
+        setNotice(`Could not load this thread: ${e instanceof Error ? e.message : String(e)}`);
+      });
+  }, [api, activeId, chats]);
 
   useEffect(() => {
     const el = logRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [current]);
 
-  const patchLast = useCallback((k: string, fn: (m: Msg) => Msg) => {
+  const patchLast = useCallback((tid: string, fn: (m: Msg) => Msg) => {
     setChats((c) => {
-      const list = c[k] ?? [];
+      const list = c[tid] ?? [];
       if (list.length === 0) return c;
-      return { ...c, [k]: [...list.slice(0, -1), fn(list[list.length - 1]!)] };
+      return { ...c, [tid]: [...list.slice(0, -1), fn(list[list.length - 1]!)] };
     });
   }, []);
+
+  const newThread = () => {
+    setActive((a) => ({ ...a, [key]: null }));
+    setNotice(null);
+    window.setTimeout(() => inputRef.current?.focus(), 0);
+  };
 
   const send = async () => {
     const text = draft.trim();
     if (!text || busy) return;
     const k = key;
-    const ctx = context;
-    const history = (chats[k] ?? [])
-      .filter((m) => !m.error && m.content)
-      .map((m) => ({ role: m.role, content: m.content }));
+    const c = ctx;
+    const chatCtx = context;
+    setNotice(null);
+    setBusyKeys((b) => ({ ...b, [k]: true }));
+    let tid = active[k] ?? null;
+    let persisted = !!tid && !tid.startsWith('local:');
+    if (!tid) {
+      try {
+        const t = await api.createThread({ context_kind: c.kind, context_id: c.id, title: text.slice(0, 60) });
+        tid = t.id;
+        persisted = true;
+        setThreads((all) => ({ ...all, [k]: [t, ...(all[k] ?? [])] }));
+        setChats((all) => ({ ...all, [t.id]: [] }));
+      } catch {
+        tid = `local:${k}`; // core without threads: keep the old in-memory behaviour
+        persisted = false;
+      }
+      const created = tid;
+      setActive((a) => ({ ...a, [k]: created }));
+    }
+    const threadId = tid;
+    const history = persisted
+      ? []
+      : (chats[threadId] ?? [])
+          .filter((m) => !m.error && m.content)
+          .map((m) => ({ role: m.role, content: m.content }));
     setDraft('');
-    setChats((c) => ({
-      ...c,
-      [k]: [
-        ...(c[k] ?? []),
+    setChats((all) => ({
+      ...all,
+      [threadId]: [
+        ...(all[threadId] ?? []),
         { id: nextId++, role: 'user', content: text },
         { id: nextId++, role: 'assistant', content: '', streaming: true },
       ],
     }));
-    setBusyKeys((b) => ({ ...b, [k]: true }));
-    const sessionId = (sessions.current[k] ??= crypto.randomUUID());
     const ac = new AbortController();
     aborts.current[k] = ac;
     await streamChat(
       cfg,
-      { messages: [...history, { role: 'user', content: text }], ...(ctx ? { context: ctx } : {}), session_id: sessionId },
       {
-        onDelta: (t) => patchLast(k, (m) => ({ ...m, content: m.content + t })),
+        messages: [...history, { role: 'user', content: text }],
+        ...(chatCtx ? { context: chatCtx } : {}),
+        ...(persisted ? { thread_id: threadId } : {}),
+      },
+      {
+        onDelta: (t) => patchLast(threadId, (m) => ({ ...m, content: m.content + t })),
         onTool: (tool, status) =>
-          patchLast(k, (m) => {
+          patchLast(threadId, (m) => {
             const tools = [...(m.tools ?? [])];
             const i = tools.findIndex((t) => t.name === tool && t.status === 'running');
             if (i >= 0 && status !== 'running') tools[i] = { name: tool, status };
             else tools.push({ name: tool, status });
             return { ...m, tools };
           }),
-        onDone: () => patchLast(k, (m) => ({ ...m, streaming: false })),
-        onError: (message) => patchLast(k, (m) => ({ ...m, streaming: false, error: message })),
+        onDone: () => patchLast(threadId, (m) => ({ ...m, streaming: false })),
+        onError: (message) => patchLast(threadId, (m) => ({ ...m, streaming: false, error: message })),
       },
       ac.signal,
     );
@@ -118,6 +245,34 @@ export function ChatPane({ cfg, context, contextLabel, hidden, onOpenSettings, o
           ✕
         </button>
       </header>
+      <div className="thread-bar" data-testid="thread-switcher">
+        <select
+          aria-label="Thread"
+          value={activeId ?? NEW_THREAD}
+          onChange={(e) => {
+            if (e.target.value === NEW_THREAD) newThread();
+            else {
+              setActive((a) => ({ ...a, [key]: e.target.value }));
+              setNotice(null);
+            }
+          }}
+        >
+          {(activeId === null || activeId === undefined || activeId.startsWith('local:')) && <option value={activeId ?? NEW_THREAD}>New thread</option>}
+          {threadList.map((t) => (
+            <option key={t.id} value={t.id}>
+              {t.title || 'Untitled'} · {timeAgo(t.updated_at || t.created_at)}
+            </option>
+          ))}
+        </select>
+        <button className="btn small" onClick={newThread} disabled={activeId === null} data-testid="new-thread">
+          New thread
+        </button>
+      </div>
+      {notice && (
+        <p className="inline-error" role="alert">
+          {notice}
+        </p>
+      )}
       <div className="chat-log" ref={logRef} role="log" aria-live="polite">
         {messages.length === 0 && !slot && (
           <div className="state empty">

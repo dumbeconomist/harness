@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api } from './lib/api';
 import { useWorkbenchData } from './lib/store';
 import type { TaskStatus } from './lib/types';
@@ -9,9 +9,12 @@ import { JournalView } from './features/journal/JournalView';
 import { LedgerView } from './features/ledger/LedgerView';
 import { SettingsView } from './features/settings/SettingsView';
 import { ChatPane } from './features/chat/ChatPane';
-import { CommandPalette, type PaletteAction } from './features/palette/CommandPalette';
-
-type View = 'tasks' | 'approvals' | 'journal' | 'ledger' | 'settings';
+import { CommandPalette } from './features/palette/CommandPalette';
+import { DoctorBanner } from './features/doctor/Doctor';
+import { QuickBar } from './features/quick/QuickBar';
+import { type CommandCtx, type UiAction, type View, VIEWS } from './lib/commands';
+import { useApprovalAlerts } from './lib/alerts';
+import { consumeHandoff, HANDOFF_KEY } from './lib/handoff';
 
 const NAV: { id: View; label: string; icon: string }[] = [
   { id: 'tasks', label: 'Tasks', icon: '☑' },
@@ -20,6 +23,17 @@ const NAV: { id: View; label: string; icon: string }[] = [
   { id: 'ledger', label: 'Ledger', icon: '$' },
   { id: 'settings', label: 'Settings', icon: '⚙' },
 ];
+
+/** `#/quick` renders the quick bar only (no sidebar, no approval card); everything else is the app. */
+export function Root() {
+  const [hash, setHash] = useState(() => window.location.hash);
+  useEffect(() => {
+    const on = () => setHash(window.location.hash);
+    window.addEventListener('hashchange', on);
+    return () => window.removeEventListener('hashchange', on);
+  }, []);
+  return hash.startsWith('#/quick') ? <QuickBar /> : <App />;
+}
 
 export function App() {
   const data = useWorkbenchData(api);
@@ -83,10 +97,6 @@ export function App() {
     return () => window.removeEventListener('workbench:palette', openPalette);
   }, [openPalette]);
 
-  const goto = useCallback((v: View) => {
-    setView(v);
-  }, []);
-
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const mod = e.metaKey || e.ctrlKey;
@@ -106,61 +116,69 @@ export function App() {
         window.setTimeout(() => window.dispatchEvent(new Event('workbench:focus-quick-add')), 0);
       } else if (/^[1-5]$/.test(e.key)) {
         e.preventDefault();
-        setView(NAV[Number(e.key) - 1]!.id);
+        setView(VIEWS[Number(e.key) - 1]!.id);
       }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, []);
 
-  const actions: PaletteAction[] = useMemo(() => {
-    const list: PaletteAction[] = [
-      {
-        id: 'new-task',
-        title: 'New task',
-        hint: '⌘N',
-        keywords: 'add create todo',
-        run: () => {
-          setView('tasks');
-          window.setTimeout(() => window.dispatchEvent(new Event('workbench:focus-quick-add')), 0);
-        },
-      },
-      ...NAV.map((n, i) => ({
-        id: `go-${n.id}`,
-        title: `Go to ${n.label}`,
-        hint: `⌘${i + 1}`,
-        run: () => goto(n.id),
-      })),
-      {
-        id: 'toggle-chat',
-        title: chatOpen ? 'Hide Hermes pane' : 'Show Hermes pane',
-        hint: '⌘J',
-        keywords: 'chat ask',
-        run: () => setChatOpen((o) => !o),
-      },
-      {
-        id: 'ask-hermes',
-        title: 'Ask Hermes…',
-        keywords: 'chat message',
-        run: () => {
-          setChatOpen(true);
-          window.setTimeout(() => window.dispatchEvent(new Event('workbench:focus-chat')), 50);
-        },
-      },
-    ];
-    if (topApproval) {
-      list.push(
-        {
-          id: 'focus-approval',
-          title: 'Review pending approval',
-          hint: '⌘⇧A',
-          keywords: 'approve deny approval card focus',
-          run: () => window.setTimeout(() => window.dispatchEvent(new Event('workbench:focus-approval')), 50),
-        }
-      );
+  const uiRef = useRef<(a: UiAction) => void>(() => undefined);
+  uiRef.current = (a) => {
+    switch (a.type) {
+      case 'goto':
+        setView(a.view);
+        break;
+      case 'new-task':
+        setView('tasks');
+        window.setTimeout(() => window.dispatchEvent(new Event('workbench:focus-quick-add')), 0);
+        break;
+      case 'toggle-chat':
+        setChatOpen((o) => !o);
+        break;
+      case 'ask-in-chat':
+        setChatOpen(true);
+        window.setTimeout(() => window.dispatchEvent(new CustomEvent('workbench:prefill-chat', { detail: a.text })), 50);
+        break;
+      case 'focus-approval':
+        // Focus only: the card keeps its own guards; nothing is decided from here.
+        window.setTimeout(() => window.dispatchEvent(new Event('workbench:focus-approval')), 50);
+        break;
+      case 'open-task':
+        setView('tasks');
+        setSelectedId(a.id);
+        setChatOpen(true);
+        break;
     }
-    return list;
-  }, [goto, chatOpen, topApproval]);
+  };
+
+  // Actions handed over by the quick bar (other window via storage, or this tab after navigating).
+  useEffect(() => {
+    const take = () => {
+      const a = consumeHandoff();
+      if (a) uiRef.current(a);
+    };
+    take();
+    const onStorage = (e: StorageEvent) => e.key === HANDOFF_KEY && take();
+    window.addEventListener('storage', onStorage);
+    window.addEventListener('focus', take);
+    return () => {
+      window.removeEventListener('storage', onStorage);
+      window.removeEventListener('focus', take);
+    };
+  }, []);
+
+  useApprovalAlerts(data.approvals);
+
+  const cmdCtx: CommandCtx = useMemo(
+    () => ({
+      api,
+      ui: (a) => uiRef.current(a),
+      pendingApprovals: data.approvals.length,
+      surface: 'palette',
+    }),
+    [data.approvals.length],
+  );
 
   const approvalCard = (docked: boolean) =>
     topApproval && (
@@ -212,6 +230,7 @@ export function App() {
         </div>
       </nav>
 
+      <DoctorBanner doctor={data.doctor} onFix={() => setView('settings')} />
       <main className="main">
         {data.connection === 'lost' && (
           <div className="banner" role="status" data-testid="connection-banner">
@@ -267,11 +286,20 @@ export function App() {
               } else flash('That approval has already been decided.');
             }} />
         )}
-        {view === 'ledger' && <LedgerView summary={data.ledger} />}
-        {view === 'settings' && <SettingsView api={api} health={data.health} onRefreshHealth={() => void refresh.health()} />}
+        {view === 'ledger' && <LedgerView summary={data.ledger} entries={data.ledgerEntries} />}
+        {view === 'settings' && <SettingsView
+            api={api}
+            health={data.health}
+            onRefreshHealth={() => {
+              void refresh.health();
+              void refresh.doctor();
+            }}
+            onDoctor={refresh.setDoctor}
+          />}
       </main>
 
       <ChatPane
+        api={api}
         cfg={api.config}
         context={selected ? { kind: 'task', id: selected.id } : null}
         contextLabel={selected?.title ?? ''}
@@ -282,7 +310,7 @@ export function App() {
       />
       {!chatOpen && approvalCard(false)}
 
-      <CommandPalette open={paletteOpen} actions={actions} onClose={() => setPaletteOpen(false)} />
+      <CommandPalette open={paletteOpen} ctx={cmdCtx} onClose={() => setPaletteOpen(false)} />
       {toast && (
         <div className="toast" role="status">
           {toast}

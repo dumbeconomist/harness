@@ -1,6 +1,9 @@
 import { loadConfig, type WorkbenchConfig } from './config';
 import type {
   Approval,
+  Doctor,
+  Thread,
+  ThreadMessage,
   ConnectionInfo,
   Health,
   HermesSettings,
@@ -95,6 +98,14 @@ export function createApi(cfg: WorkbenchConfig, fetchImpl: FetchLike = (i, init)
     getHermes: () => request<HermesSettings>('GET', '/api/settings/hermes'),
     putHermes: (b: { url?: string; api_key?: string }) => request<HermesSettings>('PUT', '/api/settings/hermes', b),
     getConnection: () => request<ConnectionInfo>('GET', '/api/settings/connection'),
+    doctor: (deep = false) => request<Doctor>('GET', `/api/doctor${deep ? '?deep=1' : ''}`),
+    latestUndoable: () => request<JournalEntry | null>('GET', '/api/journal/latest-undoable'),
+    listThreads: (context_kind?: string, context_id?: string) =>
+      request<Thread[]>('GET', `/api/threads${q({ context_kind, context_id })}`),
+    createThread: (b: { context_kind?: string; context_id?: string; title?: string }) =>
+      request<Thread>('POST', '/api/threads', b),
+    threadMessages: (id: string) => request<ThreadMessage[]>('GET', `/api/threads/${encodeURIComponent(id)}/messages`),
+    deleteThread: (id: string) => request<void>('DELETE', `/api/threads/${encodeURIComponent(id)}`),
     putPolicies: (p: Policies) => request<Policies>('PUT', '/api/settings/policies', p),
   };
 }

@@ -265,3 +265,44 @@ select { padding: 2px 4px; }
 .review-wide { display: block; width: 100%; margin: 6px 0; }
 .ac-actions { justify-content: space-between !important; }
 .ac-kbd { display: flex; gap: 6px; align-items: center; font-size: 12px; margin: 4px 0; }
+
+/* G1: ledger tiles + chart */
+.tiles { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--s2); margin-bottom: var(--s3); }
+.tile { border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-elev); padding: var(--s3); display: flex; flex-direction: column; gap: 2px; }
+.tile strong { font-size: 20px; letter-spacing: -0.01em; }
+.bar.zero { fill: var(--border); }
+.axis-line { stroke: var(--border); stroke-width: 1; }
+
+/* G1: connection doctor */
+.doctor-list { list-style: none; margin: var(--s3) 0 0; padding: 0; display: grid; gap: var(--s2); }
+.doctor-list li { padding-top: var(--s2); border-top: 1px solid var(--border); }
+.doctor-list.compact { margin-top: var(--s2); }
+.doctor-title { font-weight: 500; margin-left: var(--s2); }
+.doctor-fix { margin-top: 2px; color: var(--text); font-family: var(--mono); font-size: 12px; }
+.pill { display: inline-block; min-width: 56px; text-align: center; font-size: 11px; font-weight: 600; padding: 0 6px; border-radius: 10px; background: var(--bg-hover); color: var(--text-dim); }
+.pill.ok { background: rgba(36, 138, 61, 0.16); color: var(--ok); }
+.pill.warn { background: var(--warn-soft); color: var(--warn); }
+.pill.fail { background: var(--danger-soft); color: var(--danger); }
+/* Floats over the (empty) top strip so it can never shift content, e.g. approval lists, under a pointer. */
+.doctor-banner { position: fixed; top: 6px; left: 50%; transform: translateX(-50%); z-index: 30; max-width: min(560px, calc(100vw - 32px)); display: flex; gap: var(--s2); align-items: center; background: var(--danger-soft); color: var(--text); border: 1px solid var(--danger); border-radius: var(--radius); padding: 6px var(--s3); box-shadow: var(--shadow); backdrop-filter: blur(8px); }
+.doctor-banner-text { font-size: 12px; min-width: 0; }
+
+/* G1: chat threads */
+.thread-bar { display: flex; gap: var(--s2); padding: 6px var(--s3); border-bottom: 1px solid var(--border); }
+.thread-bar select { flex: 1; min-width: 0; }
+
+/* G1: command results + quick bar */
+.palette-result { padding: 8px 16px; border-bottom: 1px solid var(--border); max-height: 260px; overflow: auto; }
+.qr { display: grid; gap: 6px; }
+.qr-ok { color: var(--ok); }
+.qr-answer { white-space: pre-wrap; }
+.qr-actions { display: flex; gap: var(--s2); }
+.qr-list { list-style: none; margin: 0; padding: 0; }
+.quick { height: 100%; display: flex; flex-direction: column; background: var(--bg); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+.quick-input { width: 100%; border: 0; border-bottom: 1px solid var(--border); border-radius: 0; padding: 14px 16px; font-size: 17px; outline: none; background: transparent; color: var(--text); font-family: inherit; }
+.quick-body { flex: 1; overflow: auto; padding: 8px 16px; min-height: 0; }
+.quick-list { list-style: none; margin: 0 -10px; padding: 0; }
+.quick-list li { display: flex; justify-content: space-between; padding: 6px 10px; border-radius: 6px; cursor: default; }
+.quick-list li.active { background: var(--accent); color: var(--accent-text); }
+.quick-list li.active .muted, .quick-list li.active kbd { color: inherit; }
+.quick-foot { flex: none; min-height: 34px; display: flex; justify-content: space-between; align-items: center; gap: var(--s2); padding: 0 16px; border-top: 1px solid var(--border); font-size: 12px; }

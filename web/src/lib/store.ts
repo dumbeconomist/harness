@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { api as defaultApi, type Api } from './api';
 import { connectEvents, type ConnectionStatus } from './sse';
-import type { Approval, Health, JournalEntry, LedgerSummary, Task } from './types';
+import type { Approval, Doctor, Health, JournalEntry, LedgerEntry, LedgerSummary, Task } from './types';
 
 export interface LoadState {
   loaded: boolean;
@@ -13,6 +13,8 @@ export interface WorkbenchData {
   approvals: Approval[];
   journal: JournalEntry[];
   ledger: LedgerSummary | null;
+  ledgerEntries: LedgerEntry[];
+  doctor: Doctor | null;
   health: Health | null;
   connection: ConnectionStatus;
   tasksState: LoadState;
@@ -22,6 +24,8 @@ export interface WorkbenchData {
     journal: () => Promise<void>;
     ledger: () => Promise<void>;
     health: () => Promise<void>;
+    doctor: () => Promise<void>;
+    setDoctor: (d: Doctor) => void;
     all: () => Promise<void>;
   };
 }
@@ -34,6 +38,8 @@ export function useWorkbenchData(api: Api = defaultApi): WorkbenchData {
   const [approvals, setApprovals] = useState<Approval[]>([]);
   const [journal, setJournal] = useState<JournalEntry[]>([]);
   const [ledger, setLedger] = useState<LedgerSummary | null>(null);
+  const [ledgerEntries, setLedgerEntries] = useState<LedgerEntry[]>([]);
+  const [doctor, setDoctor] = useState<Doctor | null>(null);
   const [health, setHealth] = useState<Health | null>(null);
   const [connection, setConnection] = useState<ConnectionStatus>('connecting');
   const [tasksState, setTasksState] = useState<LoadState>({ loaded: false, error: null });
@@ -66,6 +72,18 @@ export function useWorkbenchData(api: Api = defaultApi): WorkbenchData {
     } catch {
       /* ignore */
     }
+    try {
+      setLedgerEntries(await api.ledgerEntries(100));
+    } catch {
+      /* ignore */
+    }
+  }, [api]);
+  const refreshDoctor = useCallback(async () => {
+    try {
+      setDoctor(await api.doctor());
+    } catch {
+      /* older core or core down: no banner (the connection banner covers core down) */
+    }
   }, [api]);
   const refreshHealth = useCallback(async () => {
     try {
@@ -75,8 +93,8 @@ export function useWorkbenchData(api: Api = defaultApi): WorkbenchData {
     }
   }, [api]);
   const refreshAll = useCallback(async () => {
-    await Promise.all([refreshTasks(), refreshApprovals(), refreshJournal(), refreshLedger(), refreshHealth()]);
-  }, [refreshTasks, refreshApprovals, refreshJournal, refreshLedger, refreshHealth]);
+    await Promise.all([refreshTasks(), refreshApprovals(), refreshJournal(), refreshLedger(), refreshHealth(), refreshDoctor()]);
+  }, [refreshTasks, refreshApprovals, refreshJournal, refreshLedger, refreshHealth, refreshDoctor]);
 
   const allRef = useRef(refreshAll);
   allRef.current = refreshAll;
@@ -121,11 +139,21 @@ export function useWorkbenchData(api: Api = defaultApi): WorkbenchData {
     return dispose;
   }, [api, refreshTasks, refreshApprovals, refreshJournal, refreshLedger]);
 
+  // The doctor talks to Hermes, so poll gently (and only while the window is visible).
+  useEffect(() => {
+    const t = window.setInterval(() => {
+      if (document.visibilityState === 'visible') void refreshDoctor();
+    }, 30_000);
+    return () => window.clearInterval(t);
+  }, [refreshDoctor]);
+
   return {
     tasks,
     approvals,
     journal,
     ledger,
+    ledgerEntries,
+    doctor,
     health,
     connection,
     tasksState,
@@ -135,6 +163,8 @@ export function useWorkbenchData(api: Api = defaultApi): WorkbenchData {
       journal: refreshJournal,
       ledger: refreshLedger,
       health: refreshHealth,
+      doctor: refreshDoctor,
+      setDoctor,
       all: refreshAll,
     },
   };

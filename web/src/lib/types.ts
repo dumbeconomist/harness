@@ -53,6 +53,9 @@ export interface LedgerEntry {
 
 export interface LedgerSummary {
   total_usd: number;
+  today_usd?: number;
+  last7_usd?: number;
+  last30_usd?: number;
   total_tokens?: number;
   unpriced_runs?: number;
   by_model: { model: string; usd: number; tokens: number; priced?: boolean }[];
@@ -100,6 +103,38 @@ export interface ChatRequest {
   messages: ChatMessage[];
   context?: ChatContext;
   session_id?: string;
+  thread_id?: string;
+}
+
+export type CheckStatus = 'ok' | 'warn' | 'fail' | 'skip';
+export interface DoctorCheck {
+  id: string;
+  title: string;
+  status: CheckStatus;
+  message: string;
+  fix?: string;
+  blocking: boolean;
+}
+export interface Doctor {
+  ok: boolean;
+  checks: DoctorCheck[];
+}
+
+export interface Thread {
+  id: string;
+  context_kind: string | null;
+  context_id: string | null;
+  title: string;
+  created_at: string;
+  updated_at: string;
+}
+export interface ThreadMessage {
+  id: string;
+  thread_id: string;
+  role: 'user' | 'assistant' | 'tool';
+  content: string;
+  tool_json: string | Record<string, unknown> | null;
+  created_at: string;
 }
 
 export type WorkbenchEventType =

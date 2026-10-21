@@ -1,22 +1,52 @@
-import type { LedgerSummary } from '../../lib/types';
-import { usd } from '../../lib/format';
+import type { LedgerEntry, LedgerSummary } from '../../lib/types';
+import { timeAgo, usd } from '../../lib/format';
 
-export function DayBars({ data }: { data: LedgerSummary['by_day'] }) {
+export const CHART_DAYS = 14;
+
+const isoDay = (d: Date) => d.toISOString().slice(0, 10);
+
+/** Exactly `n` consecutive days ending at the latest of (last data day, today); missing days are $0. */
+export function fillDays(data: LedgerSummary['by_day'], today = new Date(), n = CHART_DAYS): { day: string; usd: number }[] {
+  const byDay = new Map(data.map((d) => [d.day, d.usd]));
+  const last = data.reduce((m, d) => (d.day > m ? d.day : m), isoDay(today));
+  const end = new Date(`${last}T00:00:00Z`);
+  const out: { day: string; usd: number }[] = [];
+  for (let i = n - 1; i >= 0; i--) {
+    const day = isoDay(new Date(end.getTime() - i * 86_400_000));
+    out.push({ day, usd: byDay.get(day) ?? 0 });
+  }
+  return out;
+}
+
+export function DayBars({ data, today }: { data: LedgerSummary['by_day']; today?: Date }) {
+  const days = fillDays(data, today);
   const W = 480;
   const H = 120;
   const pad = 4;
-  const max = Math.max(...data.map((d) => d.usd), 0.0001);
-  const bw = (W - pad * 2) / Math.max(data.length, 1);
+  const max = Math.max(...days.map((d) => d.usd), 0.0001);
+  const bw = (W - pad * 2) / days.length;
   return (
-    <svg viewBox={`0 0 ${W} ${H + 18}`} className="bars" role="img" aria-label="Spend by day">
-      {data.map((d, i) => {
-        const h = Math.max(2, (d.usd / max) * H);
+    <svg viewBox={`0 0 ${W} ${H + 18}`} className="bars" role="img" aria-label="Spend by day, last 14 days" data-testid="day-chart">
+      <line x1={pad} x2={W - pad} y1={H} y2={H} className="axis-line" />
+      {days.map((d, i) => {
+        const zero = d.usd <= 0;
+        const h = zero ? 2 : Math.max(2, (d.usd / max) * H);
         return (
           <g key={d.day}>
-            <rect x={pad + i * bw + 2} y={H - h} width={Math.max(bw - 4, 2)} height={h} rx={3} className="bar">
+            <rect
+              x={pad + i * bw + 2}
+              y={H - h}
+              width={Math.max(bw - 4, 2)}
+              height={h}
+              rx={zero ? 1 : 3}
+              className={zero ? 'bar zero' : 'bar'}
+              data-testid="day-bar"
+              data-day={d.day}
+              data-usd={d.usd}
+            >
               <title>{`${d.day}: ${usd(d.usd)}`}</title>
             </rect>
-            {data.length <= 14 && (
+            {(i % 2 === 0 || i === days.length - 1) && (
               <text x={pad + i * bw + bw / 2} y={H + 13} textAnchor="middle" className="axis">
                 {d.day.slice(5)}
               </text>
@@ -28,7 +58,55 @@ export function DayBars({ data }: { data: LedgerSummary['by_day'] }) {
   );
 }
 
-export function LedgerView({ summary }: { summary: LedgerSummary | null }) {
+/** Today / 7d / 30d, from the summary (falls back to by_day where the core predates the fields). */
+export function spendTiles(s: LedgerSummary): { id: string; label: string; usd: number | null }[] {
+  const days = fillDays(s.by_day);
+  const sum = (n: number) => days.slice(-n).reduce((t, d) => t + d.usd, 0);
+  return [
+    { id: 'today', label: 'Today', usd: s.today_usd ?? days[days.length - 1]!.usd },
+    { id: '7d', label: 'Last 7 days', usd: s.last7_usd ?? sum(7) },
+    { id: '30d', label: 'Last 30 days', usd: s.last30_usd ?? null },
+  ];
+}
+
+function RunTable({ entries }: { entries: LedgerEntry[] }) {
+  if (entries.length === 0) return <p className="muted">No runs yet.</p>;
+  return (
+    <table className="table" data-testid="run-table">
+      <thead>
+        <tr>
+          <th>When</th>
+          <th>Run</th>
+          <th>Model</th>
+          <th className="num">Tokens</th>
+          <th className="num">Cost</th>
+        </tr>
+      </thead>
+      <tbody>
+        {entries.map((e) => (
+          <tr key={e.id} data-testid="run-row">
+            <td title={e.ts}>{timeAgo(e.ts)}</td>
+            <td>
+              <code>{e.run_id.slice(0, 8)}</code>
+            </td>
+            <td>{e.model}</td>
+            <td className="num">{(e.prompt_tokens + e.completion_tokens).toLocaleString()}</td>
+            <td className="num">
+              {usd(e.cost_usd)}{' '}
+              {e.source === 'unpriced' && (
+                <span className="badge unpriced" title="No price on file for this model">
+                  unpriced
+                </span>
+              )}
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
+export function LedgerView({ summary, entries = [] }: { summary: LedgerSummary | null; entries?: LedgerEntry[] }) {
   return (
     <section className="view" aria-label="Ledger">
       <header className="view-head">
@@ -37,13 +115,24 @@ export function LedgerView({ summary }: { summary: LedgerSummary | null }) {
       </header>
       {!summary ? (
         <div className="state muted">Loading ledger…</div>
-      ) : summary.by_model.length === 0 && summary.total_usd === 0 && !summary.total_tokens ? (
-        <div className="state empty">
-          <strong>No spend recorded</strong>
-          <p>Chat with Hermes and each run’s token cost shows up here.</p>
-        </div>
       ) : (
         <>
+          <div className="tiles" data-testid="spend-tiles">
+            {spendTiles(summary).map((t) => (
+              <div key={t.id} className="tile" data-testid={`tile-${t.id}`}>
+                <span className="muted">{t.label}</span>
+                <strong>{t.usd == null ? '—' : usd(t.usd)}</strong>
+              </div>
+            ))}
+          </div>
+          <h2 className="group-title">Last 14 days</h2>
+          <DayBars data={summary.by_day} />
+          {summary.by_model.length === 0 && summary.total_usd === 0 && !summary.total_tokens && (
+            <div className="state empty">
+              <strong>No spend recorded</strong>
+              <p>Chat with Hermes and each run’s token cost shows up here.</p>
+            </div>
+          )}
           <div className="total" data-testid="ledger-total">
             <span className="muted">Total spend</span>
             <strong>{usd(summary.total_usd)}</strong>
@@ -85,8 +174,8 @@ export function LedgerView({ summary }: { summary: LedgerSummary | null }) {
               ))}
             </tbody>
           </table>
-          <h2 className="group-title">By day</h2>
-          {summary.by_day.length > 0 ? <DayBars data={summary.by_day} /> : <p className="muted">No daily data.</p>}
+          <h2 className="group-title">Runs</h2>
+          <RunTable entries={entries} />
         </>
       )}
     </section>

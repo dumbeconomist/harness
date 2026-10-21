@@ -1,9 +1,11 @@
 import { useEffect, useState } from 'react';
+import { DoctorPanel } from '../doctor/Doctor';
 import { api as defaultApi, type Api } from '../../lib/api';
 import {
   KNOWN_TOOLS,
   PERMISSION_KEYS,
   type ConnectionInfo,
+  type Doctor,
   type Health,
   type HermesSettings,
   type Permissions,
@@ -27,9 +29,20 @@ interface Props {
   api?: Api;
   health: Health | null;
   onRefreshHealth?: () => void;
+  onDoctor?: (d: Doctor) => void;
 }
 
-export function SettingsView({ api = defaultApi, health, onRefreshHealth }: Props) {
+function originOf(u: string): string | null {
+  try {
+    return new URL(u.trim()).origin.toLowerCase();
+  } catch {
+    return null;
+  }
+}
+
+export function SettingsView({ api = defaultApi, health, onRefreshHealth, onDoctor }: Props) {
+  const [doctorTick, setDoctorTick] = useState(0);
+  const [notifPerm, setNotifPerm] = useState<string>(typeof Notification === 'undefined' ? 'unsupported' : Notification.permission);
   const [perms, setPerms] = useState<Permissions | null>(null);
   const [policies, setPolicies] = useState<Policies>({});
   const [error, setError] = useState<string | null>(null);
@@ -38,6 +51,7 @@ export function SettingsView({ api = defaultApi, health, onRefreshHealth }: Prop
   const [keyDraft, setKeyDraft] = useState('');
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [keyNote, setKeyNote] = useState<string | null>(null);
   const [conn, setConn] = useState<ConnectionInfo | null>(null);
   const [reveal, setReveal] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -61,13 +75,22 @@ export function SettingsView({ api = defaultApi, health, onRefreshHealth }: Prop
     setSaving(true);
     setSaved(false);
     try {
-      const h = await api.putHermes({ url: urlDraft.trim() || undefined, ...(keyDraft ? { api_key: keyDraft } : {}) });
+      // Core never forwards the old key to a new host: a host change must say what happens to the key.
+      const newOrigin = originOf(urlDraft);
+      const hostChanged = !!hermes && newOrigin !== null && newOrigin !== originOf(hermes.url);
+      const clearOldKey = hostChanged && !keyDraft;
+      const h = await api.putHermes({
+        url: urlDraft.trim() || undefined,
+        ...(keyDraft ? { api_key: keyDraft } : clearOldKey ? { api_key: '' } : {}),
+      });
+      setKeyNote(clearOldKey && hermes?.has_key ? 'The Hermes host changed, so the saved API key was cleared. Enter the new host’s key if it needs one.' : null);
       setHermes(h);
       setUrlDraft(h.url);
       setKeyDraft('');
       setSaved(true);
       setError(null);
       onRefreshHealth?.();
+      setDoctorTick((t) => t + 1);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -83,6 +106,7 @@ export function SettingsView({ api = defaultApi, health, onRefreshHealth }: Prop
       setSaved(true);
       setError(null);
       onRefreshHealth?.();
+      setDoctorTick((t) => t + 1);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -169,6 +193,9 @@ export function SettingsView({ api = defaultApi, health, onRefreshHealth }: Prop
         </button>
       </div>
 
+      <h2 className="group-title">Connection doctor</h2>
+      <DoctorPanel api={api} refreshKey={doctorTick} onResult={onDoctor} />
+
       <h2 className="group-title">Hermes</h2>
       <div className="card" data-testid="hermes-form">
         <label className="field">
@@ -204,6 +231,11 @@ export function SettingsView({ api = defaultApi, health, onRefreshHealth }: Prop
             </button>
           </span>
         </div>
+        {keyNote && (
+          <p className="inline-warn" data-testid="key-cleared-note">
+            {keyNote}
+          </p>
+        )}
         {hermes?.has_key && !hermes.key_persisted && (
           <p className="inline-warn" data-testid="key-not-persisted">
             The API key is held in memory only and will be lost when Workbench quits (no Keychain available).
@@ -243,6 +275,21 @@ export function SettingsView({ api = defaultApi, health, onRefreshHealth }: Prop
           </>
         )}
       </div>
+
+      {notifPerm === 'default' && (
+        <>
+          <h2 className="group-title">Notifications</h2>
+          <div className="card row between">
+            <span className="muted">Get a desktop notification when Hermes needs approval while Workbench is in the background. Notifications never approve anything.</span>
+            <button
+              className="btn small"
+              onClick={() => void Notification.requestPermission().then((p) => setNotifPerm(p))}
+            >
+              Enable
+            </button>
+          </div>
+        </>
+      )}
 
       <h2 className="group-title">Permissions</h2>
       <p className="muted">These capabilities don’t exist yet, so they can’t be switched on. Everything beyond tasks stays off.</p>

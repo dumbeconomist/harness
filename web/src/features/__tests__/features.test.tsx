@@ -8,7 +8,8 @@ import { ApprovalsView } from '../approvals/ApprovalsView';
 import { LedgerView } from '../ledger/LedgerView';
 import { TaskDetail } from '../tasks/TaskDetail';
 import { SettingsView } from '../settings/SettingsView';
-import { CommandPalette, filterActions } from '../palette/CommandPalette';
+import { CommandPalette, filterCommands } from '../palette/CommandPalette';
+import { COMMANDS, type CommandCtx } from '../../lib/commands';
 import type { Api } from '../../lib/api';
 import type { Approval, JournalEntry, Task } from '../../lib/types';
 
@@ -248,6 +249,27 @@ describe('SettingsView', () => {
     expect(screen.getAllByText('coming in G2–G6').length).toBe(6);
     expect(screen.getByTestId('hermes-status')).toHaveTextContent('core unreachable');
   });
+  it('changing the Hermes host clears the old key explicitly (core never forwards it) and says so', async () => {
+    const api = mkApi();
+    render(<SettingsView api={api} health={null} />);
+    await screen.findByTestId('key-not-persisted');
+    const url = screen.getByLabelText('Hermes URL');
+    await userEvent.clear(url);
+    await userEvent.type(url, 'http://127.0.0.1:9/v1');
+    await userEvent.click(screen.getByRole('button', { name: 'Save' }));
+    expect(api.putHermes).toHaveBeenCalledWith({ url: 'http://127.0.0.1:9/v1', api_key: '' });
+    expect(await screen.findByTestId('key-cleared-note')).toBeInTheDocument();
+  });
+  it('same-host URL change does not touch the key', async () => {
+    const api = mkApi();
+    render(<SettingsView api={api} health={null} />);
+    await screen.findByTestId('key-not-persisted');
+    const url = screen.getByLabelText('Hermes URL');
+    await userEvent.clear(url);
+    await userEvent.type(url, 'http://h/v2');
+    await userEvent.click(screen.getByRole('button', { name: 'Save' }));
+    expect(api.putHermes).toHaveBeenCalledWith({ url: 'http://h/v2' });
+  });
   it('saves Hermes url/key, warns when key not persisted', async () => {
     const api = mkApi();
     render(<SettingsView api={api} health={null} />);
@@ -407,23 +429,42 @@ describe('TaskDetail', () => {
   });
 });
 
+
 describe('CommandPalette', () => {
-  const actions = [
-    { id: 'a', title: 'New task', run: vi.fn() },
-    { id: 'b', title: 'Go to Ledger', run: vi.fn() },
-  ];
-  it('fuzzy filters', () => {
-    expect(filterActions(actions, 'gtl').map((a) => a.id)).toEqual(['b']);
-    expect(filterActions(actions, 'zzz')).toEqual([]);
+  const mkCtx = (over: Partial<CommandCtx> = {}): CommandCtx => ({
+    api: {} as CommandCtx['api'],
+    ui: vi.fn(),
+    pendingApprovals: 0,
+    surface: 'palette',
+    ...over,
   });
-  it('runs the highlighted action on Enter and closes on Esc', async () => {
+  it('fuzzy filters the shared registry', () => {
+    expect(filterCommands(COMMANDS, 'gtl').map((a) => a.id)).toContain('go-ledger');
+    expect(filterCommands(COMMANDS, 'zzzqq')).toEqual([]);
+  });
+  it('runs the highlighted command on Enter and closes on Esc', async () => {
     const onClose = vi.fn();
-    render(<CommandPalette open actions={actions} onClose={onClose} />);
+    const ctx = mkCtx();
+    render(<CommandPalette open ctx={ctx} onClose={onClose} />);
     await userEvent.type(screen.getByLabelText('Command'), 'ledg{Enter}');
-    expect(actions[1]!.run).toHaveBeenCalled();
+    expect(ctx.ui).toHaveBeenCalledWith({ type: 'goto', view: 'ledger' });
     expect(onClose).toHaveBeenCalled();
     onClose.mockClear();
     await userEvent.type(screen.getByLabelText('Command'), '{Escape}');
     expect(onClose).toHaveBeenCalled();
+  });
+  it('only offers Review pending approval when something is pending, and it only focuses', async () => {
+    const { rerender } = render(<CommandPalette open ctx={mkCtx()} onClose={vi.fn()} />);
+    expect(screen.queryByText('Review pending approval')).toBeNull();
+    const ctx = mkCtx({ pendingApprovals: 1 });
+    rerender(<CommandPalette open ctx={ctx} onClose={vi.fn()} />);
+    await userEvent.type(screen.getByLabelText('Command'), 'approve{Enter}');
+    expect(ctx.ui).toHaveBeenCalledWith({ type: 'focus-approval' });
+  });
+  it('slash commands run through the same path: /goto settings', async () => {
+    const ctx = mkCtx();
+    render(<CommandPalette open ctx={ctx} onClose={vi.fn()} />);
+    await userEvent.type(screen.getByLabelText('Command'), '/goto settings{Enter}');
+    expect(ctx.ui).toHaveBeenCalledWith({ type: 'goto', view: 'settings' });
   });
 });
