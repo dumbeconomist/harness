@@ -1,7 +1,7 @@
 import { expect, test } from '@playwright/test';
 import fs from 'node:fs';
 import path from 'node:path';
-import { callTool, createTask, denyAll, listTaskTitles, pendingApprovals } from './helpers';
+import { CORE, UI_AUTH, callTool, createTask, denyAll, listTaskTitles, pendingApprovals } from './helpers';
 
 const SHOTS = path.resolve(__dirname, '../screenshots');
 fs.mkdirSync(SHOTS, { recursive: true });
@@ -170,6 +170,33 @@ test.describe('G1 chat threads', () => {
     await sel.selectOption({ index: 1 });
     await expect(page.getByTestId('msg-user')).toContainText('alpha question');
     await expect(page.getByTestId('msg-user')).not.toContainText('beta question');
+  });
+});
+
+test.describe('G1 retry', () => {
+  const setHermes = (request: import('@playwright/test').APIRequestContext, url: string) =>
+    request.put(`${CORE}/api/settings/hermes`, { headers: UI_AUTH, data: { url, api_key: '' } });
+
+  test('a failed turn shows retry at once; retry re-sends exactly once and clears the marker', async ({ page, request }) => {
+    const task = await createTask(request, `Retry ${Date.now()}`);
+    await page.goto('/');
+    await page.getByTestId('task-row').filter({ hasText: task.title }).click();
+    try {
+      expect((await setHermes(request, 'http://127.0.0.1:9/v1')).ok()).toBeTruthy(); // Hermes "down"
+      await page.getByLabel('Message Hermes').fill('retry me please');
+      await page.getByLabel('Message Hermes').press('Enter');
+      await expect(page.getByTestId('not-sent')).toBeVisible(); // immediately, no reload
+      await expect(page.getByTestId('not-sent').getByRole('button', { name: 'retry' })).toBeVisible();
+      await page.screenshot({ path: shot('41-not-sent') });
+    } finally {
+      await setHermes(request, `http://127.0.0.1:${MOCK_PORT}/v1`);
+    }
+    await page.getByTestId('not-sent').getByRole('button', { name: 'retry' }).dblclick();
+    await expect(page.getByTestId('msg-assistant').last()).toContainText('retry me please');
+    await expect(page.getByTestId('msg-user')).toHaveCount(2); // the original + exactly one new turn
+    await expect(page.getByTestId('not-sent')).toHaveCount(0);
+    await expect(page.getByTestId('resent')).toBeVisible();
+    await page.screenshot({ path: shot('42-resent') });
   });
 });
 

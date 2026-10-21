@@ -28,7 +28,7 @@ export type UiAction =
   | { type: 'open-task'; id: string };
 
 /** The only API surface commands get. No decision method exists here by construction. */
-export type CommandApi = Pick<Api, 'config' | 'createTask' | 'listTasks' | 'latestUndoable' | 'undo' | 'doctor' | 'createThread'>;
+export type CommandApi = Pick<Api, 'config' | 'createTask' | 'listTasks' | 'latestUndoable' | 'undo' | 'doctor' | 'createThread' | 'listThreads'>;
 
 export interface CommandCtx {
   api: CommandApi;
@@ -329,4 +329,17 @@ export function suggest(
   if (p.kind === 'partial') return p.matches;
   if (p.kind === 'unknown') return [];
   return fuzzyFilter(commands, p.text, score);
+}
+
+export const QUICK_THREAD_TITLE = 'Quick questions';
+
+/** Quick asks share one general thread titled "Quick questions"; each ask appends to it. */
+export async function ensureQuickThread(api: Pick<CommandApi, 'listThreads' | 'createThread'>): Promise<string> {
+  try {
+    const existing = (await api.listThreads('general', 'general')).find((t) => t.title === QUICK_THREAD_TITLE);
+    if (existing) return existing.id;
+  } catch {
+    /* fall through to create */
+  }
+  return (await api.createThread({ context_kind: 'general', context_id: 'general', title: QUICK_THREAD_TITLE })).id;
 }

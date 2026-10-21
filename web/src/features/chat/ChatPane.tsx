@@ -14,6 +14,8 @@ export interface Msg {
   streaming?: boolean;
   /** Persisted user turn that never reached Hermes. */
   notSent?: boolean;
+  /** The not-sent turn was successfully re-sent as a newer turn. */
+  resent?: boolean;
   /** Persisted assistant reply cut off part-way. */
   interrupted?: boolean;
   tools?: { name: string; status: ToolStatus }[];
@@ -87,6 +89,7 @@ export function ChatPane({ api, cfg, context, contextLabel, hidden, onOpenSettin
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const logRef = useRef<HTMLDivElement>(null);
   const aborts = useRef<Record<string, AbortController>>({});
+  const sending = useRef(false);
   const requested = useRef<Set<string>>(new Set());
   const apiRef = useRef(api);
   apiRef.current = api;
@@ -190,15 +193,20 @@ export function ChatPane({ api, cfg, context, contextLabel, hidden, onOpenSettin
     });
   }, []);
 
+  const patchById = useCallback((tid: string, id: number, fn: (m: Msg) => Msg) => {
+    setChats((c) => ({ ...c, [tid]: (c[tid] ?? []).map((m) => (m.id === id ? fn(m) : m)) }));
+  }, []);
+
   const newThread = () => {
     setActive((a) => ({ ...a, [key]: null }));
     setNotice(null);
     window.setTimeout(() => inputRef.current?.focus(), 0);
   };
 
-  const send = async (override?: string) => {
+  const send = async (override?: string, retryOf?: number) => {
     const text = (override ?? draft).trim();
-    if (!text || busy) return;
+    if (!text || busy || sending.current) return;
+    sending.current = true;
     const k = key;
     const c = ctx;
     const chatCtx = context;
@@ -227,11 +235,14 @@ export function ChatPane({ api, cfg, context, contextLabel, hidden, onOpenSettin
           .filter((m) => !m.error && m.content)
           .map((m) => ({ role: m.role, content: m.content }));
     if (override === undefined) setDraft('');
+    const userMsgId = nextId++;
+    let failed = false;
+    let gotText = false;
     setChats((all) => ({
       ...all,
       [threadId]: [
         ...(all[threadId] ?? []),
-        { id: nextId++, role: 'user', content: text },
+        { id: userMsgId, role: 'user', content: text },
         { id: nextId++, role: 'assistant', content: '', streaming: true },
       ],
     }));
@@ -249,7 +260,10 @@ export function ChatPane({ api, cfg, context, contextLabel, hidden, onOpenSettin
         ...(persisted ? { thread_id: threadId } : {}),
       },
       {
-        onDelta: (t) => patchLast(threadId, (m) => ({ ...m, content: m.content + t })),
+        onDelta: (t) => {
+          gotText = true;
+          patchLast(threadId, (m) => ({ ...m, content: m.content + t }));
+        },
         onTool: (tool, status) =>
           patchLast(threadId, (m) => {
             const tools = [...(m.tools ?? [])];
@@ -259,11 +273,18 @@ export function ChatPane({ api, cfg, context, contextLabel, hidden, onOpenSettin
             return { ...m, tools };
           }),
         onDone: () => patchLast(threadId, (m) => ({ ...m, streaming: false })),
-        onError: (message) => patchLast(threadId, (m) => ({ ...m, streaming: false, error: message })),
+        onError: (message) => {
+          failed = true;
+          patchLast(threadId, (m) => ({ ...m, streaming: false, error: message }));
+          // Nothing came back: the turn never got an answer, so offer retry right away (no reload needed).
+          if (!gotText) patchById(threadId, userMsgId, (m) => ({ ...m, notSent: true }));
+        },
       },
       ac.signal,
     );
     delete aborts.current[k];
+    if (retryOf !== undefined && !failed) patchById(threadId, retryOf, (m) => ({ ...m, notSent: false, resent: true }));
+    sending.current = false;
     setBusyKeys((b) => ({ ...b, [k]: false }));
   };
 
@@ -338,9 +359,14 @@ export function ChatPane({ api, cfg, context, contextLabel, hidden, onOpenSettin
             {m.notSent && (
               <div className="msg-note" data-testid="not-sent">
                 not sent –{' '}
-                <button className="link" disabled={busy} onClick={() => void send(m.content)}>
+                <button className="retry-btn" disabled={busy} onClick={() => void send(m.content, m.id)}>
                   retry
                 </button>
+              </div>
+            )}
+            {m.resent && (
+              <div className="msg-note" data-testid="resent">
+                resent
               </div>
             )}
             {m.content || (m.streaming && !m.error ? <span className="typing">Thinking…</span> : null)}

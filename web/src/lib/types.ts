@@ -44,6 +44,7 @@ export interface LedgerEntry {
   id: string;
   ts: string;
   run_id: string;
+  run_label?: string | null;
   model: string;
   prompt_tokens: number;
   completion_tokens: number;

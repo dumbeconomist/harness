@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { streamChat } from '../../lib/sse';
 import { ApiError } from '../../lib/api';
-import { UNDO_ARM_MS, describeEntry, type CommandCtx, type CommandResult } from '../../lib/commands';
+import { UNDO_ARM_MS, ensureQuickThread, describeEntry, type CommandCtx, type CommandResult } from '../../lib/commands';
 import { timeAgo } from '../../lib/format';
 import type { JournalEntry } from '../../lib/types';
 
@@ -12,7 +12,7 @@ export interface OpenInfo {
 }
 
 /**
- * Streams an answer from Hermes inside a real "general" thread (created first, thread_id sent), so
+ * Streams an answer from Hermes inside the shared "Quick questions" general thread (looked up or created first, thread_id sent), so
  * "Open in Workbench" can show that exact thread with the Q&A already in it. No re-send.
  */
 export function AskResult({ question, ctx, onOpenInWorkbench }: { question: string; ctx: CommandCtx; onOpenInWorkbench?: (i: OpenInfo) => void }) {
@@ -22,6 +22,7 @@ export function AskResult({ question, ctx, onOpenInWorkbench }: { question: stri
   const [threadId, setThreadId] = useState<string | undefined>();
   const cfg = ctx.api.config;
   const createThread = ctx.api.createThread;
+  const listThreads = ctx.api.listThreads;
   useEffect(() => {
     const ac = new AbortController();
     setText('');
@@ -30,7 +31,7 @@ export function AskResult({ question, ctx, onOpenInWorkbench }: { question: stri
     void (async () => {
       let tid: string | undefined;
       try {
-        tid = (await createThread({ context_kind: 'general', context_id: 'general', title: question.slice(0, 60) })).id;
+        tid = await ensureQuickThread({ listThreads, createThread });
       } catch {
         tid = undefined; // core without threads: the answer still streams, just not persisted
       }
@@ -51,7 +52,7 @@ export function AskResult({ question, ctx, onOpenInWorkbench }: { question: stri
       );
     })();
     return () => ac.abort();
-  }, [cfg, createThread, question]);
+  }, [cfg, createThread, listThreads, question]);
   return (
     <div className="qr qr-ask" data-testid="ask-result">
       <div className="qr-q muted">{question}</div>

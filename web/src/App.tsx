@@ -13,7 +13,7 @@ import { CommandPalette } from './features/palette/CommandPalette';
 import { DoctorStatus } from './features/doctor/Doctor';
 import { QuickBar } from './features/quick/QuickBar';
 import { type CommandCtx, type UiAction, type View, VIEWS } from './lib/commands';
-import { requestFocusApproval } from './lib/focusApproval';
+import { FOCUS_APPROVAL_EVENT, focusRequestTarget, isExplicitFocusRequest, requestFocusApproval } from './lib/focusApproval';
 import { useApprovalAlerts } from './lib/alerts';
 import { consumeHandoff, HANDOFF_KEY } from './lib/handoff';
 
@@ -175,6 +175,26 @@ export function App() {
   }, []);
 
   useApprovalAlerts(data.approvals);
+
+  // An explicit focus request that names an approval (a tapped notification): the card handles the top one;
+  // here we cover "already handled" and "pending but not the one on screen". Focus is never moved from here.
+  const approvalsRef = useRef(data.approvals);
+  approvalsRef.current = data.approvals;
+  useEffect(() => {
+    const on = (e: Event) => {
+      if (!isExplicitFocusRequest(e)) return;
+      const id = focusRequestTarget(e);
+      if (!id) return;
+      const list = approvalsRef.current;
+      if (!list.some((a) => a.id === id)) flash('That request was already handled');
+      else if (list[0]?.id !== id) {
+        setHighlightId(id);
+        setView('approvals');
+      }
+    };
+    window.addEventListener(FOCUS_APPROVAL_EVENT, on);
+    return () => window.removeEventListener(FOCUS_APPROVAL_EVENT, on);
+  }, [flash]);
 
   const cmdCtx: CommandCtx = useMemo(
     () => ({

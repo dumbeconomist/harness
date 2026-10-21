@@ -147,6 +147,12 @@ describe('Connection doctor', () => {
     expect(container.querySelector('.doctor-slot')).toBeInTheDocument(); // slot stays: no reflow
   });
 
+  it('sidebar shows "Hermes API (HTTP 5xx)" for an upstream 5xx warning', () => {
+    const d: Doctor = { ok: false, checks: [{ id: 'hermes_reachable', title: 'Hermes API', status: 'warn', message: 'Hermes answered HTTP 502', blocking: true }] };
+    render(<DoctorStatus doctor={d} onOpen={vi.fn()} />);
+    expect(screen.getByTestId('doctor-status')).toHaveTextContent('Connection: Hermes API (HTTP 502)');
+  });
+
   it('renders backticks as code and ISO times as relative with an ISO tooltip', () => {
     const now = Date.parse('2026-10-21T12:00:00Z');
     const { container } = render(<RichText now={now} text="Run `hermes gateway run`; last seen 2026-10-21T11:58:00Z." />);
@@ -243,6 +249,27 @@ describe('thread switcher', () => {
     vi.unstubAllGlobals();
   });
 
+  it('a failed send shows retry immediately; retry sends exactly once more and marks the old turn resent', async () => {
+    const api = mkApi();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response('event: error\ndata: {"message":"Hermes down"}\n\n', { status: 200 }))
+      .mockResolvedValue(new Response('event: delta\ndata: {"text":"back"}\n\nevent: done\ndata: {}\n\n', { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    render(pane(api));
+    await screen.findByText('re: second q');
+    await userEvent.type(screen.getByLabelText('Message Hermes'), 'flaky{Enter}');
+    const retry = await screen.findByRole('button', { name: 'retry' });
+    expect(screen.getByTestId('not-sent')).toBeInTheDocument();
+    await userEvent.dblClick(retry);
+    await screen.findByText('back');
+    expect(fetchMock).toHaveBeenCalledTimes(2); // original + exactly one retry
+    expect(screen.queryByRole('button', { name: 'retry' })).toBeNull();
+    expect(screen.getByTestId('resent')).toBeInTheDocument();
+    expect(screen.getAllByTestId('msg-user').filter((m) => m.textContent?.includes('flaky'))).toHaveLength(2);
+    vi.unstubAllGlobals();
+  });
+
   it('maps tool rows to chips on the assistant reply', () => {
     const msgs = threadToMsgs([
       { id: '1', thread_id: 't', role: 'user', content: 'add a task', tool_json: null, created_at: '' },
@@ -268,6 +295,13 @@ describe('ledger chart', () => {
     expect(d).toHaveLength(14);
     expect(d.every((x) => x.usd === 0)).toBe(true);
   });
+  it('Run column prefers run_label, falling back to the last 6 chars of run_id', () => {
+    const e = { id: 'e', ts: new Date().toISOString(), run_id: 'abcdef123456', model: 'm', prompt_tokens: 1, completion_tokens: 1, cost_usd: 0, source: 'chat' };
+    render(<LedgerView summary={{ total_usd: 0, by_model: [], by_day: [] }} entries={[{ ...e, run_label: 'Chat · Buy milk' }, { ...e, id: 'e2' }]} />);
+    const rows = screen.getAllByTestId('run-row');
+    expect(rows[0]).toHaveTextContent('Chat · Buy milk');
+    expect(rows[1]).toHaveTextContent('123456');
+  });
   it('shows today/7d/30d tiles and the per-run table', () => {
     render(
       <LedgerView
@@ -279,7 +313,7 @@ describe('ledger chart', () => {
     expect(screen.getByTestId('tile-7d')).toHaveTextContent('$0.75');
     expect(screen.getByTestId('tile-30d')).toHaveTextContent('$1.00');
     expect(screen.getAllByTestId('day-bar')).toHaveLength(14);
-    expect(screen.getByTestId('run-row')).toHaveTextContent('abcdef12');
+    expect(screen.getByTestId('run-row')).toHaveTextContent('123456');
     expect(screen.getByTestId('run-row')).toHaveTextContent('15');
   });
 });
@@ -295,6 +329,7 @@ describe('QuickBar', () => {
     doctor: vi.fn(),
     decide: vi.fn(),
     createThread: vi.fn().mockResolvedValue({ id: 'thG' }),
+    listThreads: vi.fn().mockResolvedValue([]),
   });
   const fetchMock = vi.fn().mockImplementation(async () => new Response('event: delta\ndata: {"text":"Forty-two"}\n\nevent: done\ndata: {}\n\n', { status: 200 }));
   beforeEach(() => {
@@ -363,9 +398,24 @@ describe('QuickBar', () => {
     expect(await screen.findByTestId('ask-answer')).toHaveTextContent('Forty-two');
     expect(await screen.findByTestId('open-in-workbench')).toBeInTheDocument();
     expect(api.createTask).not.toHaveBeenCalled();
-    expect(api.createThread).toHaveBeenCalledWith({ context_kind: 'general', context_id: 'general', title: 'meaning of life' });
+    expect(api.createThread).toHaveBeenCalledWith({ context_kind: 'general', context_id: 'general', title: 'Quick questions' });
     const body = JSON.parse((fetchMock.mock.calls[0]![1] as RequestInit).body as string);
     expect(body.thread_id).toBe('thG');
+    vi.unstubAllGlobals();
+  });
+
+  it('reuses the single "Quick questions" thread for every ask', async () => {
+    const api = mkApi();
+    api.listThreads.mockResolvedValue([{ id: 'thQ', title: 'Quick questions' }, { id: 'other', title: 'x' }]);
+    vi.stubGlobal('fetch', fetchMock);
+    render(<QuickBar api={api as unknown as Api} />);
+    await settled();
+    await userEvent.type(screen.getByLabelText('Quick command'), 'one{Enter}');
+    await screen.findByTestId('open-in-workbench');
+    await userEvent.type(screen.getByLabelText('Quick command'), 'two{Enter}');
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    expect(api.createThread).not.toHaveBeenCalled();
+    for (const c of fetchMock.mock.calls) expect(JSON.parse((c[1] as RequestInit).body as string).thread_id).toBe('thQ');
     vi.unstubAllGlobals();
   });
 
@@ -446,6 +496,22 @@ describe('QuickBar', () => {
     expect(screen.getByLabelText('Quick command')).toHaveValue('');
     delete window.__TAURI_INTERNALS__;
     await userEvent.type(screen.getByLabelText('Quick command'), 'x{Escape}'); // browser: must not throw
+  });
+});
+
+describe('targeted focus requests', () => {
+  const mount = (id: string) =>
+    render(<ApprovalCard approval={{ id, tool: 'tasks_create', tier: 1, args_json: '{}', summary: 's', status: 'pending', requested_by: 'h', created_at: '', decided_at: null, note: null }} pendingCount={1} guardMs={0} onDecide={vi.fn()} />);
+  it('focuses the card only when the named approval is this one', () => {
+    vi.useFakeTimers();
+    mount('a1');
+    act(() => requestFocusApproval('other'));
+    act(() => void vi.advanceTimersByTime(10));
+    expect(screen.getByTestId('approval-card')).not.toHaveFocus();
+    act(() => requestFocusApproval('a1'));
+    act(() => void vi.advanceTimersByTime(10));
+    expect(screen.getByTestId('approval-card')).toHaveFocus();
+    vi.useRealTimers();
   });
 });
 

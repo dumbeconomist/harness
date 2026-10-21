@@ -103,7 +103,7 @@ function RunTable({ entries }: { entries: LedgerEntry[] }) {
           <tr key={e.id} data-testid="run-row">
             <td title={e.ts}>{timeAgo(e.ts)}</td>
             <td>
-              <code>{e.run_id.slice(0, 8)}</code>
+              <code title={e.run_id}>{e.run_label || e.run_id.slice(-6)}</code>
             </td>
             <td>{e.model}</td>
             <td className="num">{(e.prompt_tokens + e.completion_tokens).toLocaleString()}</td>

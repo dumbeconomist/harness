@@ -70,7 +70,7 @@ describe('command registry', () => {
     expect(src).not.toMatch(/\/decision/);
     expect(src).not.toMatch(/['"`]approve['"`]|['"`]deny['"`]/);
     // and the CommandApi type does not include it
-    expect(src).toMatch(/Pick<Api, 'config' \| 'createTask' \| 'listTasks' \| 'latestUndoable' \| 'undo' \| 'doctor' \| 'createThread'>/);
+    expect(src).toMatch(/Pick<Api, 'config' \| 'createTask' \| 'listTasks' \| 'latestUndoable' \| 'undo' \| 'doctor' \| 'createThread' \| 'listThreads'>/);
   });
 
   it('running EVERY command with plausible args never calls decide, and never undoes by itself', async () => {

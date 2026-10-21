@@ -5,7 +5,18 @@ import type { Doctor, DoctorCheck } from '../../lib/types';
 
 export function firstProblem(d: Doctor | null): DoctorCheck | null {
   if (!d || d.ok) return null;
-  return d.checks.find((c) => c.status === 'fail' && c.blocking) ?? d.checks.find((c) => c.status === 'fail') ?? null;
+  return (
+    d.checks.find((c) => c.status === 'fail' && c.blocking) ??
+    d.checks.find((c) => c.status === 'fail') ??
+    d.checks.find((c) => c.id === 'hermes_reachable' && c.status === 'warn' && /HTTP 5\d\d/.test(c.message)) ??
+    null
+  );
+}
+
+/** "Hermes API (HTTP 502)" when the problem is an upstream 5xx, otherwise just the title. */
+export function problemLabel(c: DoctorCheck): string {
+  const m = c.id === 'hermes_reachable' ? /HTTP (\d{3})/.exec(c.message) : null;
+  return m ? `${c.title} (HTTP ${m[1]})` : c.title;
 }
 
 const LABEL: Record<DoctorCheck['status'], string> = { ok: 'OK', warn: 'Warning', fail: 'Failed', skip: 'Skipped' };
@@ -50,7 +61,7 @@ export function DoctorStatus({ doctor, onOpen }: { doctor: Doctor | null; onOpen
         >
           <span aria-hidden>⚠</span>
           <span className="doctor-status-text">
-            Connection: {bad.title}
+            Connection: {problemLabel(bad)}
           </span>
         </button>
       )}

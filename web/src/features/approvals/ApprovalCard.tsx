@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type KeyboardEvent } from 'react';
-import { isExplicitFocusRequest } from '../../lib/focusApproval';
+import { focusRequestTarget, isExplicitFocusRequest } from '../../lib/focusApproval';
 import { parseJsonish, type Approval, type Task } from '../../lib/types';
 
 export function tierLabel(tier: number): string {
@@ -120,6 +120,8 @@ export function ApprovalCard({ docked = false, approval, pendingCount, tasks = [
   const [ready, rearm] = useArm(guardMs);
   const rearmRef = useRef(rearm);
   rearmRef.current = rearm;
+  const approvalIdRef = useRef(approval.id);
+  approvalIdRef.current = approval.id;
   const guardMsRef = useRef(guardMs);
   guardMsRef.current = guardMs;
 
@@ -127,6 +129,8 @@ export function ApprovalCard({ docked = false, approval, pendingCount, tasks = [
     mountedAt.current = Date.now();
     const focus = (e: Event) => {
       if (!isExplicitFocusRequest(e)) return; // only explicit user actions may move focus here
+      const target = focusRequestTarget(e);
+      if (target && target !== approvalIdRef.current) return; // aimed at a different approval
       setCollapsed(false);
       // Keys typed right after a programmatic focus move must do nothing: re-arm the guard.
       mountedAt.current = Date.now();
