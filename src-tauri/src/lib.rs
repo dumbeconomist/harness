@@ -7,16 +7,48 @@ use std::sync::Mutex;
 
 use tauri::{
     menu::{Menu, MenuItem},
-    tray::TrayIconBuilder,
+    tray::{TrayIcon, TrayIconBuilder},
     AppHandle, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder,
 };
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+use tauri_plugin_notification::NotificationExt;
 
 #[cfg(target_os = "macos")]
 const KEYCHAIN_SERVICE: &str = "dev.harness.workbench";
 
 /// Holds the running core so it can be shut down on exit.
 struct CoreHandle(Mutex<Option<workbench_core::RunningServer>>);
+
+/// Tray icon kept in managed state so `native_set_badge` can update its tooltip/title.
+struct TrayHandle(TrayIcon);
+
+/// JS injected into every window (after `window.__WORKBENCH__`). Calls the commands below through
+/// `__TAURI_INTERNALS__`; camelCase keys (`approvalId`) map to snake_case Rust params (`approval_id`).
+const NATIVE_INIT: &str = r#"
+(function () {
+  function call(cmd, args) {
+    try {
+      var t = window.__TAURI_INTERNALS__;
+      if (t && typeof t.invoke === 'function') {
+        return Promise.resolve(t.invoke(cmd, args)).catch(function () {});
+      }
+    } catch (e) {}
+    return Promise.resolve();
+  }
+  window.__WORKBENCH_NATIVE__ = {
+    notify: function (title, body, approvalId) {
+      return call('native_notify', {
+        title: String(title == null ? '' : title),
+        body: String(body == null ? '' : body),
+        approvalId: approvalId == null ? null : String(approvalId)
+      });
+    },
+    setBadge: function (count) {
+      return call('native_set_badge', { count: Math.max(0, Math.floor(Number(count) || 0)) });
+    }
+  };
+})();
+"#;
 
 // ---------------------------------------------------------------- keychain
 
@@ -53,10 +85,58 @@ fn show_main_window(app: &AppHandle) {
     }
 }
 
-fn open_palette(app: &AppHandle) {
-    show_main_window(app);
+fn toggle_quick_window(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window("quick") {
+        if w.is_visible().unwrap_or(false) {
+            let _ = w.hide();
+        } else {
+            let _ = w.show();
+            let _ = w.set_focus();
+        }
+    }
+}
+
+// ---------------------------------------------------------------- commands
+
+#[tauri::command]
+fn native_notify(app: AppHandle, title: String, body: String, approval_id: Option<String>) {
+    // approval_id is accepted for the contract; clicking a desktop notification just activates the app.
+    let _ = approval_id;
+    if let Err(e) = app.notification().builder().title(title).body(body).show() {
+        eprintln!("workbench: notification failed: {e}");
+    }
+}
+
+#[tauri::command]
+fn native_set_badge(app: AppHandle, count: u32) {
+    if let Some(tray) = app.try_state::<TrayHandle>() {
+        let tooltip = if count > 0 {
+            format!("Hermes Workbench - {count} pending")
+        } else {
+            "Hermes Workbench".to_string()
+        };
+        let _ = tray.0.set_tooltip(Some(tooltip));
+        let title = if count > 0 { Some(count.to_string()) } else { None };
+        let _ = tray.0.set_title(title);
+    }
+    // Dock badge (macOS): Window::set_badge_count(Option<i64>); None clears it.
     if let Some(w) = app.get_webview_window("main") {
-        let _ = w.eval("window.dispatchEvent(new CustomEvent('workbench:palette'))");
+        let _ = w.set_badge_count(if count > 0 { Some(count as i64) } else { None });
+    }
+}
+
+#[tauri::command]
+fn open_main(app: AppHandle) {
+    show_main_window(&app);
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.eval("window.dispatchEvent(new Event('workbench:focus-approval'))");
+    }
+}
+
+#[tauri::command]
+fn hide_quick(app: AppHandle) {
+    if let Some(w) = app.get_webview_window("quick") {
+        let _ = w.hide();
     }
 }
 
@@ -64,11 +144,18 @@ fn open_palette(app: &AppHandle) {
 
 pub fn run() {
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
+        .invoke_handler(tauri::generate_handler![
+            native_notify,
+            native_set_badge,
+            open_main,
+            hide_quick
+        ])
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, _shortcut, event| {
                     if event.state() == ShortcutState::Pressed {
-                        open_palette(app);
+                        toggle_quick_window(app);
                     }
                 })
                 .build(),
@@ -78,6 +165,12 @@ pub fn run() {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 let _ = window.hide();
+            }
+            // The quick window is a transient popover: hide it when it loses focus.
+            if let tauri::WindowEvent::Focused(false) = event {
+                if window.label() == "quick" {
+                    let _ = window.hide();
+                }
             }
         })
         .setup(|app| {
@@ -105,8 +198,9 @@ pub fn run() {
             };
             let base_url = format!("http://{}", server.addr);
             let init = format!(
-                "window.__WORKBENCH__ = {};",
-                serde_json::json!({ "baseUrl": base_url, "token": server.token })
+                "window.__WORKBENCH__ = {};\n{}",
+                serde_json::json!({ "baseUrl": base_url, "token": server.token }),
+                NATIVE_INIT
             );
             app.manage(CoreHandle(Mutex::new(Some(server))));
 
@@ -121,6 +215,18 @@ pub fn run() {
                 .title_bar_style(tauri::TitleBarStyle::Overlay)
                 .hidden_title(true);
             builder.build()?;
+
+            // --- quick window (hidden; toggled by Option+Space, hides on blur)
+            WebviewWindowBuilder::new(app, "quick", WebviewUrl::App("index.html#/quick".into()))
+                .title("Quick")
+                .inner_size(640.0, 360.0)
+                .decorations(false)
+                .always_on_top(true)
+                .skip_taskbar(true)
+                .visible(false)
+                .center()
+                .initialization_script(&init)
+                .build()?;
 
             // --- tray / menu-bar icon
             let show = MenuItem::with_id(app, "show", "Show Workbench", true, None::<&str>)?;
@@ -137,7 +243,8 @@ pub fn run() {
             if let Some(icon) = app.default_window_icon() {
                 tray = tray.icon(icon.clone());
             }
-            tray.build(app)?;
+            let tray_icon = tray.build(app)?;
+            app.manage(TrayHandle(tray_icon));
 
             // --- global shortcut (Option+Space). Failure (taken by another app) is non-fatal.
             if let Err(e) = app.global_shortcut().register("alt+space") {

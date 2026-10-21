@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Minimal permissions for the Workbench main window. The UI talks to workbench-core over HTTP, not IPC.",
-  "windows": ["main"],
-  "permissions": ["core:default"]
+  "description": "Permissions for the Workbench main and quick windows. The UI talks to workbench-core over HTTP; IPC is used only for native helpers (notify, badge, open_main, hide_quick).",
+  "windows": ["main", "quick"],
+  "permissions": ["core:default", "notification:default"]
 }
