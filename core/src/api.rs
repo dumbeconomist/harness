@@ -613,6 +613,29 @@ fn track_tool(chips: &mut Vec<(String, String)>, tool: &str, status: &str) {
     chips.push((tool.to_string(), status.to_string()));
 }
 
+/// Record a ledger entry and announce it; returns the cost.
+fn record_usage(st: &SharedState, run_id: &str, model: &str, usage: brain::Usage) -> f64 {
+    let rec = st.db.with(|c| {
+        ledger::record(
+            c,
+            run_id,
+            model,
+            usage.prompt_tokens,
+            usage.completion_tokens,
+        )
+    });
+    match rec {
+        Ok(entry) => {
+            st.events.emit("ledger.appended", json!(entry));
+            entry.cost_usd
+        }
+        Err(e) => {
+            tracing::error!("failed to record ledger entry: {e}");
+            0.0
+        }
+    }
+}
+
 /// How long to keep reading Hermes after the client went away.
 const CLIENT_GONE_GRACE: Duration = Duration::from_secs(60);
 
@@ -725,6 +748,7 @@ async fn chat(
         let mut gone = false; // the client disconnected
         let mut gone_at = std::time::Instant::now();
         let mut finished = false;
+        let mut pending_usage: Option<(brain::Usage, String)> = None;
         loop {
             // After a disconnect keep draining for a while so usage is not lost.
             let next = if gone {
@@ -745,11 +769,26 @@ async fn chat(
                     track_tool(&mut chips, &tool, &status);
                     sse_json("tool", json!({"tool": tool, "status": status}))
                 }
+                BrainEvent::Usage { usage, model } => {
+                    // Usage that arrived before a failure: still billed, so still recorded.
+                    pending_usage = Some((usage, model));
+                    continue;
+                }
                 BrainEvent::Error(message) => {
                     finished = true;
+                    let streamed = !text.is_empty();
+                    if let Some((usage, model)) = pending_usage.take() {
+                        record_usage(&st, &run_id, &model, usage);
+                    }
+                    if let Some(tid) = &thread_id {
+                        if streamed {
+                            // Keep what was streamed; the turn did produce something.
+                            persist_reply(&st, tid, &chips, &text, "partial");
+                        }
+                    }
                     let status = doctor::status_from_message(&message);
                     let shown = doctor::record_brain_error(&st, status, &message);
-                    if let Some(id) = &user_msg_id {
+                    if let Some(id) = user_msg_id.as_ref().filter(|_| !streamed) {
                         if let Err(e) = st.db.with(|c| threads::set_message_status(c, id, "failed"))
                         {
                             tracing::warn!("could not mark the turn failed: {}", e.message);
@@ -767,25 +806,7 @@ async fn chat(
                         let status = if gone { "partial" } else { "ok" };
                         persist_reply(&st, tid, &chips, &text, status);
                     }
-                    let rec = st.db.with(|c| {
-                        ledger::record(
-                            c,
-                            &run_id,
-                            &model,
-                            usage.prompt_tokens,
-                            usage.completion_tokens,
-                        )
-                    });
-                    let cost = match rec {
-                        Ok(entry) => {
-                            st.events.emit("ledger.appended", json!(entry));
-                            entry.cost_usd
-                        }
-                        Err(e) => {
-                            tracing::error!("failed to record ledger entry: {e}");
-                            0.0
-                        }
-                    };
+                    let cost = record_usage(&st, &run_id, &model, usage);
                     if !gone {
                         let _ = tx
                             .send(sse_json(

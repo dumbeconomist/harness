@@ -152,6 +152,13 @@ pub async fn serve(config: Config) -> anyhow::Result<RunningServer> {
         .with_context(|| format!("binding {}", config.addr))?;
     let addr = listener.local_addr()?;
 
+    {
+        let secrets: Vec<&str> = [hermes.api_key.as_deref(), Some(&token), Some(&mcp_token)]
+            .into_iter()
+            .flatten()
+            .collect();
+        doctor::scrub_persisted(&db, &secrets);
+    }
     let doctor = doctor::Doctor::load(&db);
     let (flag_tx, flag_rx) = watch::channel(false);
     let approvals_handle = approvals.clone();

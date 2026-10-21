@@ -7,6 +7,9 @@ use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+/// Upstream error bodies are read up to this many characters (not for display).
+const RAW_ERROR_CAP: usize = 4096;
+
 pub const DEFAULT_MODEL: &str = "hermes-agent";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -31,8 +34,19 @@ pub struct Usage {
 #[derive(Debug, Clone, PartialEq)]
 pub enum BrainEvent {
     Delta(String),
-    ToolProgress { tool: String, status: String },
-    Done { usage: Usage, model: String },
+    ToolProgress {
+        tool: String,
+        status: String,
+    },
+    /// Usage that arrived before the stream failed (sent just before `Error`).
+    Usage {
+        usage: Usage,
+        model: String,
+    },
+    Done {
+        usage: Usage,
+        model: String,
+    },
     Error(String),
 }
 
@@ -165,7 +179,8 @@ impl Brain for HermesBrain {
             if !resp.status().is_success() {
                 let status = resp.status();
                 let text = resp.text().await.unwrap_or_default();
-                let snippet: String = text.chars().take(300).collect();
+                // Bound memory only; the consumer redacts secrets, then clips for display.
+                let snippet: String = text.chars().take(RAW_ERROR_CAP).collect();
                 yield BrainEvent::Error(format!("Hermes returned HTTP {status}: {snippet}"));
                 return;
             }
@@ -177,11 +192,13 @@ impl Brain for HermesBrain {
                 let next = tokio::time::timeout(Duration::from_secs(120), bytes.next()).await;
                 let chunk = match next {
                     Err(_) => {
+                        if let Some(u) = acc.usage { yield BrainEvent::Usage { usage: u, model: acc.model.clone().unwrap_or_else(|| model.clone()) }; }
                         yield BrainEvent::Error("Hermes stream timed out".into());
                         return;
                     }
                     Ok(None) => break,
                     Ok(Some(Err(e))) => {
+                        if let Some(u) = acc.usage { yield BrainEvent::Usage { usage: u, model: acc.model.clone().unwrap_or_else(|| model.clone()) }; }
                         yield BrainEvent::Error(format!("Hermes stream error: {}", e.without_url()));
                         return;
                     }
@@ -216,6 +233,7 @@ impl Brain for HermesBrain {
                     match interpret(&v, &mut acc) {
                         Parsed::Delta(t) => yield BrainEvent::Delta(t),
                         Parsed::Error(m) => {
+                            if let Some(u) = acc.usage { yield BrainEvent::Usage { usage: u, model: acc.model.clone().unwrap_or_else(|| model.clone()) }; }
                             yield BrainEvent::Error(m);
                             return;
                         }

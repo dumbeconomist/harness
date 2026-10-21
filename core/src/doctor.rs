@@ -144,13 +144,41 @@ impl Doctor {
     }
 }
 
+fn scrub_value(v: &mut Value, secrets: &[&str]) {
+    match v {
+        Value::String(s) => *s = sanitize_with(secrets, s, usize::MAX),
+        Value::Array(a) => a.iter_mut().for_each(|x| scrub_value(x, secrets)),
+        Value::Object(o) => o.values_mut().for_each(|x| scrub_value(x, secrets)),
+        _ => {}
+    }
+}
+
+/// Startup scrub: run every string in the persisted doctor row through the
+/// sanitiser so a row written by an earlier build cannot keep a secret
+/// fragment. Rewrites the row only if something changed.
+pub fn scrub_persisted(db: &Db, secrets: &[&str]) {
+    let Ok(Some(mut v)) = db.with(|c| db::get_setting(c, SETTING_KEY)) else {
+        return;
+    };
+    let before = v.clone();
+    scrub_value(&mut v, secrets);
+    if v != before {
+        if let Err(e) = db.with(|c| db::set_setting(c, SETTING_KEY, &v)) {
+            tracing::warn!("could not scrub persisted doctor state: {}", e.message);
+        }
+    }
+}
+
 /// Pull the status out of the brain's "Hermes returned HTTP 401 ...: body" errors.
 pub fn status_from_message(msg: &str) -> Option<u16> {
     let rest = msg.split("HTTP ").nth(1)?;
     rest.get(..3)?.parse().ok()
 }
 
-/// Replace every known secret in `s` with `***`.
+/// Fragments of a secret this short are not worth masking (too common).
+const MIN_FRAGMENT: usize = 6;
+
+/// Replace every complete secret in `s` with `***`.
 fn redact(s: &str, secrets: &[&str]) -> String {
     let mut out = s.to_string();
     for sec in secrets.iter().filter(|x| x.len() >= 4) {
@@ -159,8 +187,42 @@ fn redact(s: &str, secrets: &[&str]) -> String {
     out
 }
 
-/// Redact the Hermes key, UI token and MCP token.
-pub fn redact_secrets(st: &SharedState, s: &str) -> String {
+/// Mask a secret that was cut by a truncation: a prefix of it at the end of
+/// `s`, or a suffix of it at the start (fragments of at least `MIN_FRAGMENT`).
+fn redact_edges(s: &str, secrets: &[&str]) -> String {
+    let mut chars: Vec<char> = s.chars().collect();
+    for sec in secrets {
+        let sc: Vec<char> = sec.chars().collect();
+        // Longest fragment first so the whole fragment goes.
+        for k in (MIN_FRAGMENT..sc.len()).rev() {
+            if chars.len() >= k && chars[chars.len() - k..] == sc[..k] {
+                chars.truncate(chars.len() - k);
+                chars.extend("***".chars());
+                break;
+            }
+        }
+        for k in (MIN_FRAGMENT..sc.len()).rev() {
+            if chars.len() >= k && chars[..k] == sc[sc.len() - k..] {
+                let rest = chars.split_off(k);
+                chars = "***".chars().chain(rest).collect();
+                break;
+            }
+        }
+    }
+    chars.into_iter().collect()
+}
+
+/// Make upstream-derived text safe to store or show: redact first (so a
+/// secret can never be cut in half by the clip), mask fragments at the
+/// edges, clip to `max` characters, then redact again.
+pub fn sanitize_with(secrets: &[&str], text: &str, max: usize) -> String {
+    let t = redact_edges(&redact(text, secrets), secrets);
+    let t = clip(&t, max);
+    redact_edges(&redact(&t, secrets), secrets)
+}
+
+/// `sanitize_with` using the Hermes key, UI token and MCP token.
+pub fn sanitize_upstream(st: &SharedState, text: &str, max: usize) -> String {
     let h = st.hermes();
     let secrets: Vec<&str> = [
         h.api_key.as_deref(),
@@ -170,14 +232,21 @@ pub fn redact_secrets(st: &SharedState, s: &str) -> String {
     .into_iter()
     .flatten()
     .collect();
-    redact(s, &secrets)
+    sanitize_with(&secrets, text, max)
 }
 
-/// The single point where a brain error is recorded: secrets are removed
-/// before the message is stored. Returns the redacted message for callers
-/// that show it (SSE, doctor).
+/// Longest message / detail shown or stored.
+const DISPLAY_MAX: usize = 300;
+
+/// Redact the Hermes key, UI token and MCP token (no clipping).
+pub fn redact_secrets(st: &SharedState, s: &str) -> String {
+    sanitize_upstream(st, s, usize::MAX)
+}
+
+/// The single point where a brain error is recorded: sanitised (redact, clip,
+/// redact) before it is stored. Returns the text for callers that show it.
 pub fn record_brain_error(st: &SharedState, status: Option<u16>, message: &str) -> String {
-    let msg = redact_secrets(st, message);
+    let msg = sanitize_upstream(st, message, DISPLAY_MAX);
     st.doctor.brain_error(&st.db, status, &msg);
     msg
 }
@@ -407,8 +476,9 @@ async fn check_deep_model(
                 .or_else(|| v["error"].as_str())
                 .map(String::from)
         })
-        .unwrap_or_else(|| clip(&text, 300));
-    let upstream = record_brain_error(st, Some(code), &clip(&upstream, 300));
+        .unwrap_or(text);
+    // Redact before clipping (inside), never the other way round.
+    let upstream = record_brain_error(st, Some(code), &upstream);
     Err((
         format!("Hermes answered HTTP {code}: {upstream}"),
         Some(upstream),
@@ -477,6 +547,14 @@ pub async fn run(st: &SharedState, deep: bool) -> Report {
                 true,
                 "Can't tell while Hermes is erroring",
             ),
+            _ if h.api_key.is_none() => b.push(
+                "hermes_auth",
+                T_KEY,
+                true,
+                "ok",
+                "No key needed: Hermes accepted requests without one",
+                None,
+            ),
             _ => b.push(
                 "hermes_auth",
                 T_KEY,
@@ -521,6 +599,13 @@ pub async fn run(st: &SharedState, deep: bool) -> Report {
             b.blocked = true;
         }
         c.message = format!("{} (deep check)", c.message);
+        if c.status == "fail" {
+            let base = c.fix.take().unwrap_or_default();
+            c.fix = Some(format!(
+                "{}. Run deep again to re-check.",
+                base.trim_end_matches('.')
+            ));
+        }
         b.checks.push(c);
     } else {
         b.skip_with(
@@ -678,11 +763,14 @@ pub async fn run(st: &SharedState, deep: bool) -> Report {
 
     // Never leak secrets, whatever the upstream echoed back.
     for c in &mut b.checks {
-        c.message = redact_secrets(st, &c.message);
-        c.fix = c.fix.as_deref().map(|f| redact_secrets(st, f));
-        c.detail = c.detail.as_deref().map(|f| redact_secrets(st, f));
+        c.message = sanitize_upstream(st, &c.message, 600);
+        c.fix = c.fix.as_deref().map(|f| sanitize_upstream(st, f, 600));
+        c.detail = c.detail.as_deref().map(|f| sanitize_upstream(st, f, 600));
     }
-    let ok = !b.checks.iter().any(|c| c.blocking && c.status == "fail");
+    // A Hermes that answers with 5xx is a warn, but it still trips `ok`.
+    let ok = !b.checks.iter().any(|c| {
+        (c.blocking && c.status == "fail") || (c.id == "hermes_reachable" && c.status == "warn")
+    });
     Report {
         ok,
         checks: b.checks,
@@ -709,6 +797,36 @@ mod tests {
         assert!(dangerous_enabled(&toolset_entries(&flags).unwrap()).is_empty());
         assert!(toolset_entries(&json!("nope")).is_none());
         assert!(toolset_entries(&json!([])).unwrap().is_empty());
+    }
+
+    #[test]
+    fn sanitize_redacts_before_clipping_and_masks_edges() {
+        let key = "sk-abcdefghijklmnop";
+        // Straddling the clip at every offset: no 6+ char fragment survives.
+        for off in 0..40 {
+            let text = format!("{}{key}{}", "x".repeat(off), "y".repeat(50));
+            for max in [
+                off + 5,
+                off + 10,
+                off + key.len() - 1,
+                off + key.len() + 1,
+                30,
+            ] {
+                let out = sanitize_with(&[key], &text, max);
+                assert!(!out.contains("sk-abc"), "off={off} max={max}: {out}");
+                for k in 6..=key.len() {
+                    assert!(!out.contains(&key[..k]), "off={off} max={max} k={k}: {out}");
+                    assert!(
+                        !out.contains(&key[key.len() - k..]),
+                        "off={off} max={max} k={k}: {out}"
+                    );
+                }
+            }
+        }
+        // A secret cut off by an earlier cap is still masked.
+        assert_eq!(sanitize_with(&[key], "err: sk-abcdefgh", 100), "err: ***");
+        assert_eq!(sanitize_with(&[key], "ghijklmnop tail", 100), "*** tail");
+        assert_eq!(sanitize_with(&[key], "plain text", 5), "plain");
     }
 
     #[test]

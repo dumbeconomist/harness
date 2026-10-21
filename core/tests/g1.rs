@@ -810,7 +810,8 @@ async fn doctor_models_5xx_warns_reachable() {
     let r = check(&d, "hermes_reachable");
     assert_eq!(r["status"], "warn");
     assert_eq!(r["message"], "Hermes answered with an error (HTTP 503)");
-    assert_eq!(d["ok"], true);
+    assert_eq!(d["ok"], false, "a 5xx is a warn that still trips ok");
+    assert_eq!(statuses(&d).iter().filter(|(_, s)| s == "fail").count(), 0);
     h.shutdown().await;
 }
 
@@ -820,16 +821,22 @@ struct TFake {
     fail: Arc<std::sync::atomic::AtomicBool>,
     delay_ms: u64,
     bodies: Arc<Mutex<Vec<Value>>>,
+    /// Error message to return while failing (default: echoes all three secrets).
+    err_message: Arc<Mutex<Option<String>>>,
+    /// Stream "A","B", usage, then an in-band error instead of finishing.
+    mid_error: Arc<std::sync::atomic::AtomicBool>,
 }
 
 async fn t_chat(State(f): State<TFake>, Json(body): Json<Value>) -> Response {
     use std::sync::atomic::Ordering;
     f.bodies.lock().unwrap().push(body.clone());
     if f.fail.load(Ordering::SeqCst) {
+        let msg = f.err_message.lock().unwrap().clone().unwrap_or_else(|| {
+            "bad credentials: Bearer hermes-secret / ui test-token / mcp test-mcp-token".into()
+        });
         return (
             StatusCode::UNAUTHORIZED,
-            Json(json!({"error": {"message":
-                "bad credentials: Bearer hermes-secret / ui test-token / mcp test-mcp-token"}})),
+            Json(json!({"error": {"message": msg}})),
         )
             .into_response();
     }
@@ -850,7 +857,21 @@ async fn t_chat(State(f): State<TFake>, Json(body): Json<Value>) -> Response {
         "data: {}\n\n",
         json!({"model":"hermes-agent","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":7}})
     ));
-    chunks.push("data: [DONE]\n\n".into());
+    if f.mid_error.load(Ordering::SeqCst) {
+        chunks.remove(3);
+        chunks.remove(2); // keep only A, B ... then usage and the error
+        chunks.truncate(2);
+        chunks.push(format!(
+            "data: {}\n\n",
+            json!({"model":"hermes-agent","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":7}})
+        ));
+        chunks.push(format!(
+            "data: {}\n\n",
+            json!({"error": {"message": "boom"}})
+        ));
+    } else {
+        chunks.push("data: [DONE]\n\n".into());
+    }
     let stream = futures::stream::iter(chunks).then(move |c| async move {
         tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
         Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(c))
@@ -868,6 +889,8 @@ async fn spawn_tfake(fail: bool, delay_ms: u64) -> (String, TFake) {
         fail: Arc::new(std::sync::atomic::AtomicBool::new(fail)),
         delay_ms,
         bodies: Default::default(),
+        err_message: Default::default(),
+        mid_error: Default::default(),
     };
     let app = Router::new()
         .route("/v1/models", get(f_models_open))
@@ -1044,4 +1067,237 @@ async fn threads_sort_by_recent_activity() {
     chat_in_thread(&h, &aid, "bump").await;
     assert_eq!(ids(&h.get("/api/threads").await), [aid, bid]);
     h.shutdown().await;
+}
+
+// ------------------------------------------------------------ round 3
+
+fn fragments(secret: &str) -> [String; 2] {
+    [
+        secret[..6].to_string(),
+        secret[secret.len() - 6..].to_string(),
+    ]
+}
+
+fn assert_clean(what: &str, text: &str, secret: &str, off: usize) {
+    assert!(
+        !text.contains(secret),
+        "{what} leaked {secret} at offset {off}: {text}"
+    );
+    for f in fragments(secret) {
+        assert!(
+            !text.contains(&f),
+            "{what} leaked fragment {f:?} at offset {off}: {text}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn secrets_echoed_across_the_clip_boundary_never_leak() {
+    let (url, f) = spawn_tfake(true, 0).await;
+    let h = Harness::start_with(30, &url).await;
+    for secret in SECRETS {
+        let l = secret.len();
+        for off in (300 - l - 45)..=(300 + l + 1) {
+            *f.err_message.lock().unwrap() =
+                Some(format!("{}{}{}", "a".repeat(off), secret, "b".repeat(40)));
+
+            // sink 1: the deep doctor response
+            let d = doctor(&h, true).await;
+            let m = check(&d, "hermes_model");
+            for field in ["message", "detail"] {
+                assert_clean(
+                    &format!("doctor {field}"),
+                    m[field].as_str().unwrap_or(""),
+                    secret,
+                    off,
+                );
+            }
+            // sink 2: persisted doctor state
+            assert_clean("settings.doctor", &db_doctor_json(&h), secret, off);
+
+            // sink 3: the chat SSE error event (and stored state again)
+            let text = h
+                .req(Method::POST, "/api/chat")
+                .json(&json!({"messages":[{"role":"user","content":"hi"}]}))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
+            assert!(text.contains("event: error"));
+            assert_clean("SSE", &text, secret, off);
+            assert_clean(
+                "settings.doctor after chat",
+                &db_doctor_json(&h),
+                secret,
+                off,
+            );
+        }
+    }
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn mid_stream_error_keeps_partial_text_and_usage() {
+    let (url, f) = spawn_tfake(false, 0).await;
+    f.mid_error.store(true, std::sync::atomic::Ordering::SeqCst);
+    let h = Harness::start_with(30, &url).await;
+    let (_, t) = h.post("/api/threads", json!({})).await;
+    let tid = t["id"].as_str().unwrap();
+    let evs = chat_in_thread(&h, tid, "go").await;
+    assert_eq!(evs.last().unwrap().0, "error");
+    let msgs = h.get(&format!("/api/threads/{tid}/messages")).await;
+    let msgs = msgs.as_array().unwrap();
+    assert_eq!(msgs.len(), 2);
+    assert_eq!(
+        msgs[0]["status"], "ok",
+        "a turn that produced text is not 'failed'"
+    );
+    assert_eq!(msgs[1]["role"], "assistant");
+    assert_eq!(msgs[1]["content"], "AB");
+    assert_eq!(msgs[1]["status"], "partial");
+    let e = h.get("/api/ledger/entries").await;
+    assert_eq!(e.as_array().unwrap().len(), 1);
+    assert_eq!(e[0]["prompt_tokens"], 5);
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn doctor_no_key_configured_says_so() {
+    let url = spawn_fake(Cfg::new()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = config(dir.path(), 30, &url);
+    cfg.hermes_api_key = None;
+    let server = serve(cfg).await.unwrap();
+    let h = Harness {
+        base: format!("http://{}", server.addr),
+        token: server.token.clone(),
+        mcp_token: server.mcp_token.clone(),
+        server,
+        client: reqwest::Client::new(),
+        dir,
+    };
+    let d = doctor(&h, false).await;
+    let a = check(&d, "hermes_auth");
+    assert_eq!(a["status"], "ok");
+    assert_eq!(
+        a["message"],
+        "No key needed: Hermes accepted requests without one"
+    );
+    h.shutdown().await;
+
+    // with a key, the old wording stays
+    let url = spawn_fake(Cfg::new()).await;
+    let h = Harness::start_with(30, &url).await;
+    let d = doctor(&h, false).await;
+    assert_eq!(
+        check(&d, "hermes_auth")["message"],
+        "The API key is accepted"
+    );
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn cached_deep_failure_is_replaced_by_a_newer_passing_deep_check() {
+    let (url, f) = spawn_tfake(true, 0).await;
+    let h = Harness::start_with(30, &url).await;
+    let d = doctor(&h, true).await;
+    assert_eq!(check(&d, "hermes_model")["status"], "fail");
+    let d = doctor(&h, false).await;
+    let m = check(&d, "hermes_model");
+    assert_eq!(m["status"], "fail");
+    assert!(m["fix"]
+        .as_str()
+        .unwrap()
+        .contains("Run deep again to re-check"));
+    assert_eq!(d["ok"], false);
+
+    f.fail.store(false, std::sync::atomic::Ordering::SeqCst);
+    // a plain run does not re-test the model, so the failure is still shown
+    assert_eq!(
+        check(&doctor(&h, false).await, "hermes_model")["status"],
+        "fail"
+    );
+    let d = doctor(&h, true).await;
+    assert_eq!(check(&d, "hermes_model")["status"], "ok");
+    let d = doctor(&h, false).await;
+    assert_eq!(check(&d, "hermes_model")["status"], "ok");
+    assert_eq!(d["ok"], true);
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn ledger_entries_have_a_short_run_label() {
+    let fake = fake_hermes("hermes-agent", None).await;
+    let h = Harness::start_with(30, &fake.url).await;
+    for _ in 0..2 {
+        h.req(Method::POST, "/api/chat")
+            .json(&json!({"messages":[{"role":"user","content":"hi"}]}))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+    }
+    let e = h.get("/api/ledger/entries").await;
+    let e = e.as_array().unwrap();
+    assert_eq!(e.len(), 2);
+    for x in e {
+        let rid = x["run_id"].as_str().unwrap();
+        assert_eq!(x["run_label"].as_str().unwrap(), &rid[rid.len() - 6..]);
+    }
+    assert_ne!(e[0]["run_label"], e[1]["run_label"]);
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn startup_scrubs_secret_fragments_from_a_stored_doctor_row() {
+    let h = Harness::start().await;
+    let dir = h.dir.path().to_path_buf();
+    h.server.shutdown().await;
+    let seeded = json!({
+        "mcp_client_info": {"name": "test-mcp-tok"},
+        "brain_last_ok_at": "2026-01-01T00:00:00.000Z",
+        "brain_last_error": {
+            "at": "2026-01-01T00:00:00.000Z",
+            "status": 401,
+            "message": format!("{}hermes-sec", "x".repeat(290)),
+        },
+    });
+    {
+        let c = rusqlite::Connection::open(dir.join("workbench.db")).unwrap();
+        c.execute(
+            "INSERT INTO settings(key, value_json) VALUES ('doctor', ?1)
+             ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json",
+            [seeded.to_string()],
+        )
+        .unwrap();
+    }
+    let server = serve(config(&dir, 30, "http://127.0.0.1:1/v1"))
+        .await
+        .unwrap();
+    let raw: String = {
+        let c = rusqlite::Connection::open(dir.join("workbench.db")).unwrap();
+        c.query_row(
+            "SELECT value_json FROM settings WHERE key='doctor'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert!(!raw.contains("hermes-sec"), "{raw}");
+    assert!(!raw.contains("test-mcp-tok"), "{raw}");
+    let v: Value = serde_json::from_str(&raw).unwrap();
+    assert!(v["brain_last_error"]["message"]
+        .as_str()
+        .unwrap()
+        .ends_with("***"));
+    assert_eq!(v["brain_last_error"]["status"], 401);
+    assert_eq!(
+        v["brain_last_ok_at"], "2026-01-01T00:00:00.000Z",
+        "clean fields untouched"
+    );
+    server.shutdown().await;
 }

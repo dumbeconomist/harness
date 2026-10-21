@@ -13,11 +13,19 @@ pub struct LedgerEntry {
     pub id: String,
     pub ts: String,
     pub run_id: String,
+    /// Short distinguishable tail of `run_id` (UUIDv7 prefixes look identical).
+    pub run_label: String,
     pub model: String,
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
     pub cost_usd: f64,
     pub source: String,
+}
+
+/// The last 6 characters of a run id.
+pub fn run_label(run_id: &str) -> String {
+    let n = run_id.chars().count();
+    run_id.chars().skip(n.saturating_sub(6)).collect()
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -47,10 +55,12 @@ pub struct Summary {
 }
 
 fn row(r: &Row) -> rusqlite::Result<LedgerEntry> {
+    let run_id: String = r.get(2)?;
     Ok(LedgerEntry {
         id: r.get(0)?,
         ts: r.get(1)?,
-        run_id: r.get(2)?,
+        run_label: run_label(&run_id),
+        run_id,
         model: r.get(3)?,
         prompt_tokens: r.get(4)?,
         completion_tokens: r.get(5)?,
@@ -73,6 +83,7 @@ pub fn record(
         id: new_id(),
         ts: now(),
         run_id: run_id.to_string(),
+        run_label: run_label(run_id),
         model: model.to_string(),
         prompt_tokens,
         completion_tokens,
@@ -218,6 +229,17 @@ mod tests {
         assert!((s.today_usd - 3.0).abs() < 1e-9);
         assert!((s.last30_usd - 3.0).abs() < 1e-9);
         assert_eq!(entries(&c, 2).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn run_labels_are_the_last_six_chars() {
+        assert_eq!(run_label("01a15bfe-9218-7555-a204-379bf138875d"), "38875d");
+        assert_eq!(run_label("abc"), "abc");
+        let db = Db::open_memory().unwrap();
+        let c = db.lock();
+        let e = record(&c, "run-123456789", "m", 1, 1).unwrap();
+        assert_eq!(e.run_label, "456789");
+        assert_eq!(entries(&c, 1).unwrap()[0].run_label, "456789");
     }
 
     #[test]
