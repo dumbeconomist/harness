@@ -78,6 +78,9 @@ impl workbench_core::SecretStore for KeychainStore {
 // ---------------------------------------------------------------- window
 
 fn show_main_window(app: &AppHandle) {
+    // Un-hide the app first (it may have been hidden to return focus to the previous app).
+    #[cfg(target_os = "macos")]
+    let _ = app.show();
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.show();
         let _ = w.unminimize();
@@ -85,10 +88,43 @@ fn show_main_window(app: &AppHandle) {
     }
 }
 
+const FOCUS_APPROVAL_JS: &str =
+    "window.dispatchEvent(new CustomEvent('workbench:focus-approval', {detail:{explicit:true}}))";
+
+/// Show+focus main and ask the web app to focus the approval (explicit user intent).
+fn open_main_focus_approval(app: &AppHandle) {
+    show_main_window(app);
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.eval(FOCUS_APPROVAL_JS);
+    }
+}
+
+/// Hide the quick window, tell its webview to reset, and hand focus back to the previously
+/// active app (macOS: hide this app, but only when main is not visible so main is not hidden too).
+fn hide_quick_window(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window("quick") {
+        let was_visible = w.is_visible().unwrap_or(false);
+        let _ = w.hide();
+        let _ = w.eval("window.dispatchEvent(new Event('workbench:quick-hidden'))");
+        #[cfg(target_os = "macos")]
+        if was_visible {
+            let main_visible = app
+                .get_webview_window("main")
+                .and_then(|m| m.is_visible().ok())
+                .unwrap_or(false);
+            if !main_visible {
+                let _ = app.hide();
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = was_visible;
+    }
+}
+
 fn toggle_quick_window(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("quick") {
         if w.is_visible().unwrap_or(false) {
-            let _ = w.hide();
+            hide_quick_window(app);
         } else {
             let _ = w.show();
             let _ = w.set_focus();
@@ -126,18 +162,17 @@ fn native_set_badge(app: AppHandle, count: u32) {
 }
 
 #[tauri::command]
-fn open_main(app: AppHandle) {
-    show_main_window(&app);
-    if let Some(w) = app.get_webview_window("main") {
-        let _ = w.eval("window.dispatchEvent(new Event('workbench:focus-approval'))");
+fn open_main(app: AppHandle, focus_approval: bool) {
+    if focus_approval {
+        open_main_focus_approval(&app);
+    } else {
+        show_main_window(&app);
     }
 }
 
 #[tauri::command]
 fn hide_quick(app: AppHandle) {
-    if let Some(w) = app.get_webview_window("quick") {
-        let _ = w.hide();
-    }
+    hide_quick_window(&app);
 }
 
 // ---------------------------------------------------------------- entry
@@ -169,7 +204,7 @@ pub fn run() {
             // The quick window is a transient popover: hide it when it loses focus.
             if let tauri::WindowEvent::Focused(false) = event {
                 if window.label() == "quick" {
-                    let _ = window.hide();
+                    hide_quick_window(window.app_handle());
                 }
             }
         })
@@ -224,9 +259,22 @@ pub fn run() {
                 .always_on_top(true)
                 .skip_taskbar(true)
                 .visible(false)
+                .visible_on_all_workspaces(true)
                 .center()
                 .initialization_script(&init)
                 .build()?;
+
+            // --- notification click (macOS: notify-rust wait_for_response -> `tap`) opens main on the
+            // approval. Registered before any notification is shown (the plugin only tracks
+            // clicks for notifications shown after a handler exists).
+            {
+                let handle = app.handle().clone();
+                app.notification().on_action(move |performed| {
+                    if performed.action_id() == "tap" {
+                        open_main_focus_approval(&handle);
+                    }
+                })?;
+            }
 
             // --- tray / menu-bar icon
             let show = MenuItem::with_id(app, "show", "Show Workbench", true, None::<&str>)?;
