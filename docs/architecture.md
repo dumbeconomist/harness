@@ -187,3 +187,75 @@ user message matches `/add (?:a )?task(?: to)? (.+)/i`, the mock emits
 `event: hermes.tool.progress {tool:"mcp__workbench__tasks_create",toolCallId,status:"running"}`,
 calls `/mcp` `tools/call tasks_create {title}` (blocking), then emits `status:"completed"` and streams
 `Added task: <title>` or `Could not add task: <error text>`.
+
+## G1 contract: Shell & command surface (supersedes nothing above; additive)
+
+### Core (new)
+**Doctor tracking.** Core records (in memory, plus `settings` for persistence across restarts):
+`mcp.last_initialize_at`, `mcp.last_tools_list_at`, `mcp.last_tool_call_at`, `mcp.client_info`
+(from initialize `clientInfo`), `brain.last_ok_at`, `brain.last_error {at, status, message}`.
+
+`GET /api/doctor` (ui token) → `{ok: bool, checks: Check[]}`. Checks run in order; a later check is
+`skip` if an earlier blocking one fails.
+```
+Check = {id, title, status: "ok"|"warn"|"fail"|"skip", message, fix?: string, blocking: bool}
+```
+| id | How | fail / warn → fix text |
+|---|---|---|
+| `hermes_reachable` | GET `{HERMES_URL}/models` (3s) | fail: "Start the locked profile: `hermes -p workbench gateway run`" |
+| `hermes_auth` | same response: 401/403 = fail | fail: "Paste the profile's API_SERVER_KEY in Settings → Hermes" |
+| `hermes_model` | POST `/chat/completions` max_tokens 1, non-stream (8s); only when `?deep=1` | fail with the upstream error |
+| `mcp_connected` | `mcp.last_initialize_at` set | warn: "Hermes hasn't connected to Workbench yet. Add WORKBENCH_MCP_TOKEN to the profile .env and restart the gateway" |
+| `mcp_tools_seen` | `mcp.last_tools_list_at` set | warn: "Hermes connected but never listed tools; check `mcp_servers.workbench` in the profile config.yaml" |
+| `profile_locked` | GET `{HERMES_URL}/toolsets` (or `{base}/v1/toolsets`) if 200: fail if `terminal` or `file` has `enabled:true`; 404 → warn "can't verify" | fail: "Hermes can use its own terminal/file tools, which bypass Workbench approvals. Use the locked profile (README step 1)" |
+`ok` = no `fail` among blocking checks. Doctor never returns secrets.
+
+**Threads.** Migration adds:
+```
+threads(id TEXT PK, context_kind TEXT NULL, context_id TEXT NULL, title TEXT, created_at, updated_at)
+messages(id TEXT PK, thread_id TEXT REFERENCES threads(id) ON DELETE CASCADE, role TEXT CHECK in (user,assistant,tool),
+         content TEXT, tool_json TEXT NULL, created_at)
+```
+- `GET /api/threads?context_kind=&context_id=` → `Thread[]` newest first
+- `POST /api/threads {context_kind?, context_id?, title?}` → `Thread`
+- `GET /api/threads/:id/messages` → `Message[]` oldest first
+- `DELETE /api/threads/:id` → 204
+- `POST /api/chat` accepts `thread_id?`. When present, core persists the user message before
+  streaming and the assistant message (plus tool chips as `role:"tool"` rows with `tool_json`) on done,
+  and sends `X-Hermes-Session-Id: <thread_id>`. When `thread_id` is present, `messages` in the body is
+  ignored except the last user message; history comes from the DB. Old callers (no thread_id) keep working.
+
+**Undo helper.** `GET /api/journal/latest-undoable` → `JournalEntry | null` (newest entry with an inverse,
+not undone, not stale-blocked).
+
+**Ledger.** `GET /api/ledger/summary` adds `today_usd`, `last7_usd`, `last30_usd`, and `by_day` covers the last
+14 days including zero days. `GET /api/ledger/entries?limit=` already exists.
+
+### Web (new)
+- `web/src/lib/commands.ts`: one registry `Command {id, title, keywords, slash?, run(args, ctx)}`
+  used by the ⌘K palette AND the quick bar. Slash commands: `/task <title>`, `/ask <q>`, `/find <text>`,
+  `/goto <tasks|approvals|activity|ledger|settings>`, `/undo` (shows the entry and requires an explicit
+  confirm click or a second Enter on a *Confirm* button that appears after a 600ms arm), `/status` (doctor).
+  **No command may approve or deny.**
+- Route `#/quick` renders `QuickBar` only (no sidebar): a single input, suggestions list, result area,
+  and an "N approvals waiting → Open" link that posts `workbench:open-main` (shell) or navigates (web).
+  Esc posts `workbench:hide-quick`. Free text with no slash = `/ask`.
+- Settings → **Connection doctor** panel (Run / Run deep). An app-wide banner shows when the doctor's `ok`
+  is false, with the first failing check and its fix; it can be dismissed for the session.
+- ChatPane: thread per context (task id or "general"), a thread switcher, "New thread", history loaded on open.
+- Ledger: 14-day SVG bar chart, today/7d/30d tiles, per-run table.
+- Notifications (web side): when `document.visibilityState === 'hidden'` or the window lacks focus and
+  `approval.created` arrives, call `window.__WORKBENCH_NATIVE__?.notify({title, body, approvalId})` if present
+  (the shell injects it); else use the browser Notification API if granted. Clicking → focus the approval card.
+  Notifications carry no approve/deny actions. Badge: `window.__WORKBENCH_NATIVE__?.setBadge(count)`.
+
+### Shell (new)
+- Second window `quick` (label `quick`): 640×360, `decorations(false)`, `always_on_top(true)`,
+  `skip_taskbar(true)`, `visible(false)`, `center()`, url `index.html#/quick`, same initialization script.
+  ⌥Space toggles **quick** (show+focus / hide). It hides on blur. The old palette-on-main behaviour moves to ⌘K only.
+- `tauri-plugin-notification`; inject `window.__WORKBENCH_NATIVE__ = {notify, setBadge}` via JS→Rust
+  commands `native_notify`, `native_set_badge` (tray tooltip/title shows the pending count; dock badge
+  via `set_badge_count` if available, otherwise tray title only).
+- Events from web: `workbench:open-main` → show and focus main and emit `workbench:focus-approval` into main;
+  `workbench:hide-quick` → hide quick. Implement as Tauri commands `open_main`, `hide_quick`, which the web
+  calls through `window.__TAURI_INTERNALS__` only when present (guard for browser/e2e).

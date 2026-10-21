@@ -49,3 +49,19 @@ pane) to "add a task to buy milk" → approval card appears → approve → task
   promoting tier-1 tools to `auto`; never auto-promotes; tier-2 never eligible. (G2)
 - **Style profile** (Town "learns how you work"): drafts use a user-editable voice profile stored
   in Hermes memory. (G4)
+
+## G1 acceptance criteria: Shell & command surface
+- [ ] ⌥Space opens a quick bar even when the main window is hidden; Esc or blur hides it
+- [ ] Shared command registry: ⌘K and the quick bar list the same commands; `/task`, `/ask`, `/find`,
+      `/goto`, `/undo` (explicit confirm, armed), `/status` all work; **no path from palette/quick bar/notification decides an approval**
+- [ ] Free text in the quick bar streams a Hermes answer with "Open in Workbench"
+- [ ] Approval while hidden → native notification + tray/badge count; click focuses the card
+- [ ] Connection doctor: correct status + actionable fix for each mock failure mode (Hermes down, 401,
+      never connected to /mcp, connected but no tools/list, unlocked profile exposing terminal); banner until ok
+- [ ] Chat threads persist per object across task switches and reloads; stable X-Hermes-Session-Id per thread
+- [ ] Ledger: 14-day chart (zero days shown), today/7d/30d, per-run table
+- [ ] All G0 e2e still green; macOS CI builds the dmg with the quick window + notification plugin
+
+**Human checklist (M2, deferred G0 + G1):** install dmg → README quickstart → Settings → Connection doctor all
+green → ⌥Space → "add a task to buy milk" → notification while hidden → approve in card → task listed →
+`/undo` → gone.
