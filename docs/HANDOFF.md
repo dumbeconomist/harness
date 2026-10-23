@@ -117,7 +117,7 @@ Commits end with the attribution trailer used throughout `git log`. Push only to
 | Milestone | Status |
 |---|---|
 | **G0** Foundation (core, MCP gate, undo, idempotency, ledger, web UI, shell, CI, Hermes spike) | **Done.** Final review 8.48 with no P0. Its one must-fix (card height) was fixed after scoring. The owner accepted it and chose to defer the M2 test. |
-| **G1** Shell & command surface (⌥Space quick bar, `/` commands, notifications + badge, connection doctor, persisted chat threads, ledger chart) | **Code complete, in review.** R1 7.23 (P0 focus steal) → R2 8.23 (must-fix: redaction ran after clipping) → **R3 fixes pushed at `eb85d15`, CI green on Linux and macOS.** The round-3 independent review was started (it was interrupted once by a usage limit). **If no R3 score is in `docs/scorecard.md`, run the R3 review yourself (§7 step 1).** |
+| **G1** Shell & command surface (⌥Space quick bar, `/` commands, notifications + badge, connection doctor, persisted chat threads, ledger chart) | **Code complete; round 4 (the last) pending.** R1 7.23 (P0 focus steal) → R2 8.23 (redaction after clipping) → **R3 8.39, no P0** at `eb85d15` (CI green on Linux and macOS). Round 4 needs the two must-fixes in §7 step 1, then a fresh review. |
 | G2–G7 | Not started. Scope is in §8. |
 
 **Never run against real Hermes or on a real Mac.** CI builds the `.dmg` but nothing has exercised it at runtime. The owner's first M2 test will cover G0 and G1 together; the human checklist is at the bottom of `docs/rubric.md`. The connection doctor (Settings, or `/status`) is built to make that first run diagnose itself.
@@ -155,12 +155,24 @@ Each rule below was a reviewer-found P0 or must-fix. Regression tests exist for 
 
 ## 7. Next steps (in order)
 
-1. **Finish the G1 gate.**
-   - If `docs/scorecard.md` has no G1 round-3 row, run an independent review of HEAD per §4: gates, adversarial probes, and scoring against the G1 criteria in `docs/rubric.md`.
-   - Probe hardest at the §6 rules and at secret redaction: straddle a secret across the 300-char clip, and try URL-encoded, JSON-escaped and chunked variants.
-   - Log the result.
-   - If it scores ≥ 8.5 with no P0, G1 passes. Otherwise run round 4: fix the listed deltas, gate, push, re-review.
-   - After round 4, escalate to the owner rather than looping.
+1. **Finish the G1 gate: round 4, the last round.** R3 scored 8.39 with no P0. Both must-fixes are web-only.
+   - **Must-fix A:** the highlight scroll moves enabled Approve buttons under the pointer.
+     - In `web/src/features/approvals/ApprovalsView.tsx` (~L35), a targeted focus event for a non-top row calls `scrollIntoView` while the user is already on Approvals, and doesn't re-arm the rows. The existing `stable` guard only fires when the set of ids changes.
+     - Fix: lock or re-arm **all** rows (visibly disabled) for `guardMs` whenever `highlightId` changes, and keep them locked until scrolling settles.
+     - e2e: with 8 pending tier-1 approvals at 1280×700, park the pointer on an Approve column, dispatch targeted events for rows 3–7, sample `elementFromPoint` every 20 ms for 600 ms, and assert no **enabled** `row-approve` ever lands under the pointer.
+   - **Must-fix B:** the global send lock silently drops messages.
+     - In `web/src/features/chat/ChatPane.tsx`, the `sending` ref is global while `busy` is per context. While a stream is open in one chat (often blocked on an approval), Send in another chat does nothing and gives no feedback.
+     - Fix: key the lock per thread or context.
+     - e2e: start a blocking ask in General (the mock's "add a task to …" waits on an approval), switch to a task, send there, and assert the reply arrives.
+   - **Worth doing in the same round:**
+     - Persist the "resent" state in core: mark the original failed message as `resent`, so a reload doesn't offer retry again. Today, Enter on it after a reload makes a third turn.
+     - Drop a cached deep-check failure after a successful chat. Don't show a cached deep "ok" while `hermes_reachable` warns.
+     - Redaction hardening in `core/src/doctor.rs`: mask any 8+ character prefix or suffix of a secret **anywhere** in the string, not only at the edges.
+     - Shell (`src-tauri/src/lib.rs`): when a tapped notification's id is unknown, open Approvals without focusing a card, instead of the `map.last` fallback.
+     - Look up the "Quick questions" thread by a dedicated id or kind instead of by title, and cap the quick-thread history sent to Hermes (e.g. the last 10 turns).
+   - **Then:** run the gates (§3), push, get green CI, and do a fresh independent review (§4) focused on these items plus a full §6 regression sweep. Log the result.
+   - If R4 is still below 8.5, **escalate to the owner**. Don't start round 5. The last G0 escalation is in the scorecard: the owner accepted 8.48 with no P0.
+
 2. **Hand the owner the M2 test** (G0+G1): the `.dmg` from the HEAD `macos-build` run, plus the human checklist in `docs/rubric.md`. Expect real-Hermes issues, and use the doctor output to triage them. Areas most likely to need runtime fixes:
    - ⌥Space clashing with Spotlight or input sources
    - whether `on_action("tap")` fires for an ad-hoc-signed app
